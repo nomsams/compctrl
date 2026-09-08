@@ -1,0 +1,26 @@
+name: Build Windows companion
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run pack:windows
+      - uses: actions/upload-artifact@v7
+        with:
+          name: CompCtrl-Windows
+          path: release/*.exe
+          if-no-files-found: error
