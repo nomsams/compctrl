@@ -24,6 +24,7 @@ declare global {
         pairingCode: string;
         controllerUrl: string;
         jigglerEnabled: boolean;
+        screenBlanked: boolean;
         autoStart: boolean;
         version: string;
       }>;
@@ -34,7 +35,9 @@ declare global {
       }): Promise<void>;
       dispatch(message: import('@/lib/protocol').ControllerMessage): Promise<void>;
       setJiggler(enabled: boolean): Promise<void>;
+      setDisplayBlanked(enabled: boolean): Promise<boolean>;
       systemAction(action: 'restart' | 'shutdown'): Promise<void>;
+      onDisplayState(callback: (enabled: boolean) => void): () => void;
       onBeforeQuit(callback: () => void): () => void;
     };
   }

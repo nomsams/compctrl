@@ -6,6 +6,7 @@ import {
   Clipboard,
   Copy,
   Crosshair,
+  EyeOff,
   ChevronDown,
   ChevronUp,
   Gauge,
@@ -17,6 +18,7 @@ import {
   Monitor,
   MousePointer2,
   MousePointerClick,
+  PictureInPicture2,
   Power,
   RefreshCw,
   RotateCcw,
@@ -86,6 +88,12 @@ import {
 } from '@/lib/protocol';
 
 type Modifier = 'Control' | 'Alt' | 'Shift' | 'Meta';
+
+type WebkitPiPVideo = HTMLVideoElement & {
+  webkitPresentationMode?: string;
+  webkitSetPresentationMode?(mode: 'inline' | 'picture-in-picture'): void;
+  webkitSupportsPresentationMode?(mode: 'picture-in-picture'): boolean;
+};
 
 const keyRows = [
   ['Escape', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8', 'F9', 'F10', 'F11', 'F12'],
@@ -166,6 +174,8 @@ export function RemoteController() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [computerName, setComputerName] = useState('Windows PC');
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
+  const [screenBlanked, setScreenBlanked] = useState(false);
+  const [displayControlSupported, setDisplayControlSupported] = useState(false);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scannerStatus, setScannerStatus] = useState('Starting camera…');
   const connectionRef = useRef<DataConnection | null>(null);
@@ -282,6 +292,7 @@ export function RemoteController() {
     const connect = () => {
       if (disposed) return;
       setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
+      setDisplayControlSupported(false);
       peer = newPeer();
 
       peer.on('open', () => {
@@ -306,8 +317,15 @@ export function RemoteController() {
           if (message.type === 'ready') {
             setComputerName(message.computerName);
             setJigglerEnabled(message.jigglerEnabled);
+            const supported = typeof message.screenBlanked === 'boolean';
+            setDisplayControlSupported(supported);
+            setScreenBlanked(supported && message.screenBlanked);
           } else if (message.type === 'status') {
             setJigglerEnabled(message.jigglerEnabled);
+            if (typeof message.screenBlanked === 'boolean') {
+              setDisplayControlSupported(true);
+              setScreenBlanked(message.screenBlanked);
+            }
           } else if (message.type === 'pong') {
             lastPongRef.current = Date.now();
           }
@@ -321,7 +339,10 @@ export function RemoteController() {
         callRef.current = incomingCall;
         incomingCall.answer();
         incomingCall.on('stream', (remoteStream) => setStream(remoteStream));
-        incomingCall.on('close', () => setStream(null));
+        incomingCall.on('close', () => {
+          setStream(null);
+          scheduleReconnect();
+        });
         incomingCall.on('error', scheduleReconnect);
       });
 
@@ -351,11 +372,30 @@ export function RemoteController() {
     };
     window.addEventListener('online', reconnectWhenOnline);
 
+    const resumeWhenVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (connectionRef.current?.open && callRef.current) {
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = null;
+        lastPongRef.current = Date.now();
+        setConnectionState('connected');
+        send({ type: 'ping', sentAt: Date.now() });
+        return;
+      }
+      reconnectWhenOnline();
+    };
+    document.addEventListener('visibilitychange', resumeWhenVisible);
+    window.addEventListener('pageshow', resumeWhenVisible);
+    window.addEventListener('focus', resumeWhenVisible);
+
     return () => {
       disposed = true;
       window.clearInterval(heartbeat);
       if (retryTimer) clearTimeout(retryTimer);
       window.removeEventListener('online', reconnectWhenOnline);
+      document.removeEventListener('visibilitychange', resumeWhenVisible);
+      window.removeEventListener('pageshow', resumeWhenVisible);
+      window.removeEventListener('focus', resumeWhenVisible);
       cleanTransport();
     };
   }, [reconnectNonce, send, sessionCode]);
@@ -407,6 +447,13 @@ export function RemoteController() {
         setJigglerEnabled={(enabled) => {
           setJigglerEnabled(enabled);
           send({ type: 'jiggler', enabled });
+        }}
+        screenBlanked={screenBlanked}
+        displayControlSupported={displayControlSupported}
+        setScreenBlanked={(blanked) => {
+          if (!displayControlSupported) return;
+          setScreenBlanked(blanked);
+          send({ type: 'display', blanked });
         }}
         send={send}
         disconnect={disconnect}
@@ -540,6 +587,9 @@ type RemoteSurfaceProps = {
   stream: MediaStream | null;
   jigglerEnabled: boolean;
   setJigglerEnabled(enabled: boolean): void;
+  screenBlanked: boolean;
+  displayControlSupported: boolean;
+  setScreenBlanked(blanked: boolean): void;
   send(message: ControllerMessage): boolean;
   disconnect(): void;
   reconnect(): void;
@@ -553,6 +603,9 @@ function RemoteSurface({
   stream,
   jigglerEnabled,
   setJigglerEnabled,
+  screenBlanked,
+  displayControlSupported,
+  setScreenBlanked,
   send,
   disconnect,
   reconnect,
@@ -600,6 +653,8 @@ function RemoteSurface({
   const [immersive, setImmersive] = useState(false);
   const [immersiveToolbarOpen, setImmersiveToolbarOpen] = useState(false);
   const [nativeKeyboardActive, setNativeKeyboardActive] = useState(false);
+  const [pipSupported, setPipSupported] = useState(false);
+  const [pipActive, setPipActive] = useState(false);
   const [pointerMode, setPointerMode] = useState<'touchpad' | 'direct'>(() => {
     if (typeof window === 'undefined') return 'touchpad';
     return window.localStorage.getItem('compctrl.pointerMode') === 'direct' ? 'direct' : 'touchpad';
@@ -711,6 +766,30 @@ function RemoteSurface({
     video.addEventListener('resize', measureStage);
     return () => video.removeEventListener('resize', measureStage);
   }, [measureStage, stream]);
+
+  useEffect(() => {
+    const video = videoRef.current as WebkitPiPVideo | null;
+    if (!video) return;
+    const standardSupported = Boolean(document.pictureInPictureEnabled && video.requestPictureInPicture);
+    const webkitSupported = Boolean(video.webkitSupportsPresentationMode?.('picture-in-picture'));
+    setPipSupported(standardSupported || webkitSupported);
+
+    const entered = () => setPipActive(true);
+    const left = () => setPipActive(false);
+    const webkitChanged = () => setPipActive(video.webkitPresentationMode === 'picture-in-picture');
+    video.addEventListener('enterpictureinpicture', entered);
+    video.addEventListener('leavepictureinpicture', left);
+    video.addEventListener('webkitpresentationmodechanged', webkitChanged);
+    return () => {
+      video.removeEventListener('enterpictureinpicture', entered);
+      video.removeEventListener('leavepictureinpicture', left);
+      video.removeEventListener('webkitpresentationmodechanged', webkitChanged);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!stream) setPipActive(false);
+  }, [stream]);
 
   useEffect(() => {
     const stage = stageRef.current;
@@ -1009,6 +1088,26 @@ function RemoteSurface({
     quickKeyboardInputRef.current?.focus({ preventScroll: true });
   };
 
+  const setPictureInPicture = async (enabled: boolean) => {
+    const video = videoRef.current as WebkitPiPVideo | null;
+    if (!video || !stream) return;
+    try {
+      if (enabled) {
+        if (document.pictureInPictureEnabled && video.requestPictureInPicture) {
+          await video.requestPictureInPicture();
+        } else if (video.webkitSupportsPresentationMode?.('picture-in-picture')) {
+          video.webkitSetPresentationMode?.('picture-in-picture');
+        }
+      } else if (document.pictureInPictureElement) {
+        await document.exitPictureInPicture();
+      } else if (video.webkitPresentationMode === 'picture-in-picture') {
+        video.webkitSetPresentationMode?.('inline');
+      }
+    } catch {
+      setPipActive(false);
+    }
+  };
+
   const connected = connectionState === 'connected';
   const statusText = connected
     ? stream ? 'Live' : 'Securing video'
@@ -1026,11 +1125,11 @@ function RemoteSurface({
   } as CSSProperties;
 
   return (
-    <main className={`remote-shell ${immersive ? 'is-immersive' : ''} ${immersive && !immersiveToolbarOpen ? 'controls-hidden' : ''} ${nativeKeyboardActive ? 'has-native-keyboard' : ''}`}>
+    <main className={`remote-shell ${immersive ? 'is-immersive' : ''} ${immersive && !immersiveToolbarOpen ? 'controls-hidden' : ''} ${nativeKeyboardActive ? 'has-native-keyboard' : ''} ${screenBlanked ? 'screen-blanked' : ''}`}>
       <header className="remote-topbar">
         <div className="min-w-0">
           <div className="flex items-center gap-2"><span className={`remote-state-dot ${connected ? 'is-live' : ''}`} /><strong className="truncate">{computerName}</strong></div>
-          <p>{statusText} · {code.slice(0, 4)} {code.slice(4)}</p>
+          <p>{statusText}{screenBlanked ? ' · Local screens off' : ''} · {code.slice(0, 4)} {code.slice(4)}</p>
         </div>
         <div className="remote-topbar-actions">
           <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => void setImmersiveMode(true)} aria-label="Enter fullscreen controller">
@@ -1106,6 +1205,19 @@ function RemoteSurface({
             <ZoomOut /> {view.scale.toFixed(1)}× · Reset
           </button>
         )}
+        {screenBlanked && (
+          <button type="button" className="screen-blank-chip" onClick={() => setScreenBlanked(false)}>
+            <EyeOff /> Local screens off <small>Turn on</small>
+          </button>
+        )}
+        <div className="scroll-buttons" aria-label="Scroll controls">
+          <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: -360 })} disabled={!connected} aria-label="Scroll up">
+            <ChevronUp /><span>Up</span>
+          </button>
+          <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: 360 })} disabled={!connected} aria-label="Scroll down">
+            <ChevronDown /><span>Down</span>
+          </button>
+        </div>
       </div>
 
       <nav className="remote-toolbar" aria-label="Remote control shortcuts">
@@ -1259,6 +1371,19 @@ function RemoteSurface({
               <span><strong>Permanent magnifier</strong><small>Keep the 3× crosshair view visible while moving</small></span>
               <Switch checked={magnifierPinned} onCheckedChange={setMagnifierPinned} aria-label="Always show precision magnifier" />
             </div>
+            <div className="control-row">
+              <span className="control-row-icon"><PictureInPicture2 /></span>
+              <span>
+                <strong>Floating mini video</strong>
+                <small>{pipSupported ? 'Keep the computer visible over other apps' : 'Not available in this browser'}</small>
+              </span>
+              <Switch
+                checked={pipActive}
+                disabled={!pipSupported || !stream}
+                onCheckedChange={(checked) => void setPictureInPicture(checked)}
+                aria-label="Show the computer in picture-in-picture"
+              />
+            </div>
             <div className="control-section-label">Pointer</div>
             <div className="control-row">
               <span className="control-row-icon"><Hand /></span>
@@ -1312,6 +1437,19 @@ function RemoteSurface({
                 <span className="control-row-icon"><RefreshCw /></span><span><strong>Retry connection</strong><small>Start a fresh rendezvous now</small></span><ArrowRight />
               </button>
             )}
+            <div className="control-row">
+              <span className="control-row-icon"><EyeOff /></span>
+              <span>
+                <strong>Turn local screens off</strong>
+                <small>{displayControlSupported ? 'Desktop remains visible here · Recovery: Ctrl+Alt+Shift+F12' : 'Install the latest Windows companion to enable'}</small>
+              </span>
+              <Switch
+                checked={screenBlanked}
+                disabled={!displayControlSupported}
+                onCheckedChange={setScreenBlanked}
+                aria-label="Turn the computer screens off locally"
+              />
+            </div>
             <div className="control-row">
               <span className="control-row-icon safe"><Gauge /></span>
               <span><strong>Screen jiggler</strong><small>Move the pointer slightly every 30 seconds</small></span>

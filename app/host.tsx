@@ -7,6 +7,7 @@ import {
   Check,
   CircleHelp,
   Copy,
+  EyeOff,
   ExternalLink,
   Laptop,
   Link2,
@@ -57,11 +58,13 @@ export function HostController() {
   const [controllerUrl, setControllerUrl] = useState('');
   const [urlDraft, setUrlDraft] = useState('');
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
+  const [screenBlanked, setScreenBlanked] = useState(false);
   const [autoStart, setAutoStart] = useState(true);
   const [controllerName, setControllerName] = useState('Phone');
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState('Starting secure session…');
   const jigglerRef = useRef(false);
+  const screenBlankedRef = useRef(false);
   const connectionRef = useRef<DataConnection | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -76,6 +79,7 @@ export function HostController() {
   }, []);
 
   useEffect(() => { jigglerRef.current = jigglerEnabled; }, [jigglerEnabled]);
+  useEffect(() => { screenBlankedRef.current = screenBlanked; }, [screenBlanked]);
 
   const send = useCallback((message: HostMessage) => {
     if (connectionRef.current?.open) void connectionRef.current.send(message);
@@ -90,7 +94,14 @@ export function HostController() {
     if (message.type === 'jiggler') {
       await api.setJiggler(message.enabled);
       setJigglerEnabled(message.enabled);
-      send({ type: 'status', jigglerEnabled: message.enabled });
+      send({ type: 'status', jigglerEnabled: message.enabled, screenBlanked: screenBlankedRef.current });
+      return;
+    }
+    if (message.type === 'display') {
+      const blanked = await api.setDisplayBlanked(message.blanked);
+      setScreenBlanked(blanked);
+      setNotice(blanked ? 'Local screens are private' : 'Local screens restored');
+      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
       return;
     }
     if (message.type === 'system') {
@@ -111,11 +122,21 @@ export function HostController() {
       setControllerUrl(settings.controllerUrl);
       setUrlDraft(settings.controllerUrl);
       setJigglerEnabled(settings.jigglerEnabled);
+      setScreenBlanked(settings.screenBlanked);
       setAutoStart(settings.autoStart);
       void api.saveSettings({ pairingCode: code });
     });
     return () => { disposed = true; };
   }, [api]);
+
+  useEffect(() => {
+    if (!api) return;
+    return api.onDisplayState((blanked) => {
+      setScreenBlanked(blanked);
+      setNotice(blanked ? 'Local screens are private' : 'Local screens restored');
+      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
+    });
+  }, [api, send]);
 
   useEffect(() => {
     if (!api || !pairingCode) return;
@@ -180,7 +201,7 @@ export function HostController() {
       setNotice('Phone connected');
 
       incoming.on('open', () => {
-        void incoming.send({ type: 'ready', computerName, jigglerEnabled: jigglerRef.current } satisfies HostMessage);
+        void incoming.send({ type: 'ready', computerName, jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current } satisfies HostMessage);
         void shareScreenWith(incoming.peer);
       });
       incoming.on('data', (data) => {
@@ -323,7 +344,19 @@ export function HostController() {
                 onCheckedChange={(enabled) => {
                   setJigglerEnabled(enabled);
                   void api?.setJiggler(enabled);
-                  send({ type: 'status', jigglerEnabled: enabled });
+                  send({ type: 'status', jigglerEnabled: enabled, screenBlanked: screenBlankedRef.current });
+                }}
+              />
+            </div>
+            <div className="host-setting-row">
+              <span className="host-setting-icon"><EyeOff /></span>
+              <span><strong>Privacy screen</strong><small>Remote stays active · Recovery: Ctrl+Alt+Shift+F12</small></span>
+              <Switch
+                checked={screenBlanked}
+                onCheckedChange={(blanked) => {
+                  setScreenBlanked(blanked);
+                  void api?.setDisplayBlanked(blanked);
+                  send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
                 }}
               />
             </div>

@@ -4,9 +4,11 @@ const {
   Menu,
   Tray,
   desktopCapturer,
+  globalShortcut,
   ipcMain,
   nativeImage,
   powerSaveBlocker,
+  screen,
   session,
   shell,
 } = require('electron');
@@ -29,6 +31,8 @@ let nativeBridgeReady = false;
 let nativeQueue = [];
 let jigglerTimer = null;
 let displaySleepBlocker = null;
+let privacyWindows = [];
+let screenBlanked = false;
 let isQuitting = false;
 
 function generateCode() {
@@ -136,9 +140,78 @@ function runSystemAction(action) {
   child.unref();
 }
 
+function destroyPrivacyWindows() {
+  for (const privacyWindow of privacyWindows.splice(0)) {
+    if (!privacyWindow.isDestroyed()) privacyWindow.destroy();
+  }
+}
+
+function createPrivacyWindow(display) {
+  const privacyWindow = new BrowserWindow({
+    ...display.bounds,
+    show: false,
+    frame: false,
+    focusable: false,
+    movable: false,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    backgroundColor: '#000000',
+    hasShadow: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      backgroundThrottling: false,
+    },
+  });
+  privacyWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+  privacyWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  privacyWindow.setIgnoreMouseEvents(true, { forward: true });
+  privacyWindow.setContentProtection(true);
+  const privacyHtml = encodeURIComponent('<!doctype html><meta name="color-scheme" content="dark"><style>html,body{width:100%;height:100%;margin:0;overflow:hidden;background:#000;cursor:none}</style>');
+  void privacyWindow.loadURL(`data:text/html;charset=utf-8,${privacyHtml}`).then(() => {
+    if (screenBlanked && !privacyWindow.isDestroyed()) privacyWindow.showInactive();
+  }).catch((error) => {
+    console.error('Could not create the privacy curtain:', error);
+    if (!privacyWindow.isDestroyed()) privacyWindow.destroy();
+  });
+  return privacyWindow;
+}
+
+function updateTrayMenu() {
+  if (!tray) return;
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Open CompCtrl', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
+    ...(screenBlanked ? [{ label: 'Turn local screens back on', click: () => setScreenBlanked(false) }] : []),
+    { type: 'separator' },
+    { label: 'Quit', click: () => { isQuitting = true; app.quit(); } },
+  ]));
+}
+
+function syncPrivacyWindows() {
+  destroyPrivacyWindows();
+  if (!screenBlanked || !app.isReady()) return;
+  privacyWindows = screen.getAllDisplays().map(createPrivacyWindow);
+}
+
+function setScreenBlanked(enabled) {
+  screenBlanked = Boolean(enabled);
+  syncPrivacyWindows();
+  updateTrayMenu();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('compctrl:display-state', screenBlanked);
+  }
+  return screenBlanked;
+}
+
 function registerIpc() {
   ipcMain.handle('compctrl:get-settings', () => ({
     ...settings,
+    screenBlanked,
     computerName: os.hostname(),
     version: app.getVersion(),
   }));
@@ -170,6 +243,8 @@ function registerIpc() {
     writeSettings(settings);
     configureJiggler(settings.jigglerEnabled);
   });
+
+  ipcMain.handle('compctrl:set-display-blanked', (_event, enabled) => setScreenBlanked(enabled));
 
   ipcMain.handle('compctrl:system-action', (_event, action) => {
     if (action === 'restart' || action === 'shutdown') runSystemAction(action);
@@ -256,11 +331,7 @@ async function createWindow() {
 function createTray() {
   tray = new Tray(trayIcon());
   tray.setToolTip('CompCtrl companion');
-  tray.setContextMenu(Menu.buildFromTemplate([
-    { label: 'Open CompCtrl', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
-    { type: 'separator' },
-    { label: 'Quit', click: () => { isQuitting = true; app.quit(); } },
-  ]));
+  updateTrayMenu();
   tray.on('double-click', () => { mainWindow?.show(); mainWindow?.focus(); });
 }
 
@@ -289,11 +360,24 @@ if (!app.requestSingleInstanceLock()) {
 
     createTray();
     await createWindow();
+    const recoveryShortcutRegistered = globalShortcut.register(
+      'CommandOrControl+Alt+Shift+F12',
+      () => setScreenBlanked(false),
+    );
+    if (!recoveryShortcutRegistered) {
+      console.warn('The privacy-screen recovery shortcut Ctrl+Alt+Shift+F12 is already in use.');
+    }
+    screen.on('display-added', syncPrivacyWindows);
+    screen.on('display-removed', syncPrivacyWindows);
+    screen.on('display-metrics-changed', syncPrivacyWindows);
   });
 }
 
 app.on('before-quit', () => { isQuitting = true; });
 app.on('will-quit', () => {
+  screenBlanked = false;
+  destroyPrivacyWindows();
+  globalShortcut.unregisterAll();
   if (jigglerTimer) clearInterval(jigglerTimer);
   nativeBridge?.kill();
   staticServer?.close();

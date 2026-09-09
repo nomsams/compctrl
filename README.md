@@ -45,7 +45,10 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 - Open session controls to switch between touchpad and direct-touch positioning, change pointer speed, disable tap-to-click, or enable drag/select. Drag/select is off by default to prevent accidental text selection.
 - Use the always-visible **Ctrl+C** and **Ctrl+V** buttons for clipboard shortcuts.
 - **Type** opens the phone's native keyboard in a compact typing strip by default. Enable **Show full PC key panel** when you want the keyboard button to open function keys, modifiers, navigation keys, and arrows instead.
+- Use the dedicated **Up** and **Down** buttons on the edge of the desktop for reliable one-tap scrolling, or keep using the two-finger scroll gesture.
+- **Floating mini video** uses the phone browser's Picture-in-Picture mode when available, so the live computer view can stay above other apps. Return to the controller at any time; it resumes the existing session or reconnects automatically after mobile background suspension.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
+- **Turn local screens off** covers every Windows display with a capture-excluded black privacy curtain. The phone continues showing and controlling the desktop underneath. Restore the displays from the phone, the companion, the tray, or with **Ctrl+Alt+Shift+F12**.
 - A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active code across a page reload. Disconnecting manually disables auto-reconnect.
 
 ## Security and network notes
@@ -55,6 +58,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 - WebRTC encrypts media and data in transit. The default public PeerJS signaling service can see connection metadata such as the temporary peer ID and IP addresses, but not decrypted screen or input data.
 - This build intentionally has no default TURN relay so the screen does not fall back to a third-party media server. A direct P2P route may fail on restrictive corporate, hotel, or carrier networks.
 - The native bridge accepts commands only through Electron IPC; it does not open a local TCP port. Restart and shutdown are unavailable until a paired WebRTC data channel is open, and the phone UI requires a press-and-hold confirmation.
+- Privacy-screen state is deliberately not saved across a companion restart. It blacks the local displays without powering down the monitor hardware, because Windows wakes a hardware-powered-off display as soon as remote mouse or keyboard input is injected.
 
 ## Project layout
 
