@@ -18,6 +18,7 @@ const path = require('node:path');
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const JIGGLE_INTERVAL_MS = 30_000;
+const DEFAULT_CONTROLLER_URL = 'https://nomsams.github.io/compctrl/';
 const isDevelopment = !app.isPackaged;
 
 let mainWindow = null;
@@ -42,7 +43,7 @@ function settingsPath() {
 function defaultSettings() {
   return {
     pairingCode: generateCode(),
-    controllerUrl: process.env.COMPCTRL_WEB_URL || '',
+    controllerUrl: process.env.COMPCTRL_WEB_URL || DEFAULT_CONTROLLER_URL,
     jigglerEnabled: false,
     autoStart: true,
   };
@@ -50,7 +51,13 @@ function defaultSettings() {
 
 function readSettings() {
   try {
-    return { ...defaultSettings(), ...JSON.parse(fs.readFileSync(settingsPath(), 'utf8')) };
+    const defaults = defaultSettings();
+    const stored = JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
+    return {
+      ...defaults,
+      ...stored,
+      controllerUrl: stored.controllerUrl || defaults.controllerUrl,
+    };
   } catch {
     return defaultSettings();
   }

@@ -10,7 +10,7 @@ Requirements: Windows 10/11 and Node.js 22 or newer.
 
 1. In PowerShell, run `./Start-CompCtrl.ps1` from this folder.
 2. On the companion window, copy the eight-character pairing code.
-3. Open the phone controller at `http://<computer-ip>:3000` during development, or at the published GitHub Pages address, then enter the code.
+3. Open the [published phone controller](https://nomsams.github.io/compctrl/) or scan the QR code in the companion, then enter the code.
 
 For development, use two terminals:
 
@@ -20,7 +20,7 @@ npm run dev
 ./Start-CompCtrl.ps1
 ```
 
-`Start-CompCtrl.ps1 -WebUrl 'https://YOUR-NAME.github.io/compctrl/'` pre-fills the Pages address used in the companion's QR code. You can also paste and save that address in the companion window later.
+The companion is preconfigured with `https://nomsams.github.io/compctrl/` for one-scan QR pairing. Use `Start-CompCtrl.ps1 -WebUrl 'https://another-address.example/'` only to override it during development.
 
 Closing the companion window sends it to the Windows notification tray. “Start with Windows” is enabled by default. The screen jiggler runs in the companion every 30 seconds even when the phone is disconnected.
 
@@ -57,4 +57,3 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 - `companion/main.cjs` — tray app, screen-capture permission, persistence, and protected system operations
 - `companion/native-bridge.ps1` — persistent Win32 mouse and keyboard bridge
 - `.github/workflows/` — GitHub Pages deployment and Windows packaging
-
