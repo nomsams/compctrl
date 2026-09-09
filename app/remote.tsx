@@ -6,10 +6,14 @@ import {
   Clipboard,
   Copy,
   Crosshair,
+  ChevronDown,
+  ChevronUp,
   Gauge,
   Hand,
   Keyboard,
+  Maximize2,
   Menu,
+  Minimize2,
   Monitor,
   MousePointer2,
   MousePointerClick,
@@ -27,6 +31,7 @@ import type { DataConnection, MediaConnection } from 'peerjs';
 import type QrScanner from 'qr-scanner';
 import {
   type ChangeEvent,
+  type SyntheticEvent as ReactSyntheticEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type CSSProperties,
@@ -556,6 +561,8 @@ function RemoteSurface({
   const stageRef = useRef<HTMLButtonElement>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
   const keyboardInputRef = useRef<HTMLInputElement>(null);
+  const quickKeyboardInputRef = useRef<HTMLInputElement>(null);
+  const nativeFullscreenRef = useRef(false);
   const pointerState = useRef({
     points: new Map<number, {
       clientX: number;
@@ -590,6 +597,9 @@ function RemoteSurface({
   const [contentBox, setContentBox] = useState<RemoteRect>({ left: 0, top: 0, width: 0, height: 0 });
   const [view, setView] = useState<RemoteView>({ scale: 1, centerX: 0.5, centerY: 0.5 });
   const [magnifierOpen, setMagnifierOpen] = useState(false);
+  const [immersive, setImmersive] = useState(false);
+  const [immersiveToolbarOpen, setImmersiveToolbarOpen] = useState(false);
+  const [nativeKeyboardActive, setNativeKeyboardActive] = useState(false);
   const [pointerMode, setPointerMode] = useState<'touchpad' | 'direct'>(() => {
     if (typeof window === 'undefined') return 'touchpad';
     return window.localStorage.getItem('compctrl.pointerMode') === 'direct' ? 'direct' : 'touchpad';
@@ -606,6 +616,14 @@ function RemoteSurface({
     if (typeof window === 'undefined') return 1.25;
     return clamp(Number(window.localStorage.getItem('compctrl.sensitivity')) || 1.25, 0.6, 2);
   });
+  const [magnifierPinned, setMagnifierPinned] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem('compctrl.magnifierPinned') === 'true';
+  });
+  const [keyboardPanelEnabled, setKeyboardPanelEnabled] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem('compctrl.keyboardPanel') === 'true';
+  });
 
   const vibrate = useCallback((duration = 18) => {
     if ('vibrate' in navigator) navigator.vibrate(duration);
@@ -614,6 +632,26 @@ function RemoteSurface({
   const updateView = useCallback((next: RemoteView) => {
     viewRef.current = next;
     setView(next);
+  }, []);
+
+  const setImmersiveMode = useCallback(async (enabled: boolean) => {
+    setImmersive(enabled);
+    setImmersiveToolbarOpen(false);
+    if (enabled) {
+      try {
+        if (document.fullscreenEnabled && !document.fullscreenElement) {
+          await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+          nativeFullscreenRef.current = true;
+        }
+      } catch {
+        nativeFullscreenRef.current = false;
+      }
+      return;
+    }
+    if (document.fullscreenElement) {
+      await document.exitFullscreen().catch(() => undefined);
+    }
+    nativeFullscreenRef.current = false;
   }, []);
 
   const measureStage = useCallback(() => {
@@ -691,14 +729,30 @@ function RemoteSurface({
   useEffect(() => () => endActiveGesture(), [endActiveGesture]);
 
   useEffect(() => {
+    const onFullscreenChange = () => {
+      if (!document.fullscreenElement && nativeFullscreenRef.current) {
+        nativeFullscreenRef.current = false;
+        setImmersive(false);
+        setImmersiveToolbarOpen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
+
+  useEffect(() => {
     window.localStorage.setItem('compctrl.pointerMode', pointerMode);
     window.localStorage.setItem('compctrl.dragSelection', String(dragSelectionEnabled));
     window.localStorage.setItem('compctrl.tapToClick', String(tapToClick));
     window.localStorage.setItem('compctrl.sensitivity', String(sensitivity));
-  }, [dragSelectionEnabled, pointerMode, sensitivity, tapToClick]);
+    window.localStorage.setItem('compctrl.magnifierPinned', String(magnifierPinned));
+    window.localStorage.setItem('compctrl.keyboardPanel', String(keyboardPanelEnabled));
+  }, [dragSelectionEnabled, keyboardPanelEnabled, magnifierPinned, pointerMode, sensitivity, tapToClick]);
+
+  const magnifierVisible = Boolean(stream) && (magnifierOpen || magnifierPinned);
 
   useEffect(() => {
-    if (!magnifierOpen) return;
+    if (!magnifierVisible) return;
     let frame = 0;
     const draw = () => {
       const video = videoRef.current;
@@ -739,7 +793,7 @@ function RemoteSurface({
     };
     frame = requestAnimationFrame(draw);
     return () => cancelAnimationFrame(frame);
-  }, [magnifierOpen]);
+  }, [magnifierVisible]);
 
   const handleHardwareKey = (event: ReactKeyboardEvent<HTMLButtonElement>, action: 'down' | 'up') => {
     if (event.nativeEvent.isComposing || event.key === 'Unidentified') return;
@@ -931,6 +985,30 @@ function RemoteSurface({
     setActiveModifiers([]);
   };
 
+  const relayKeyboardInput = (event: ReactSyntheticEvent<HTMLInputElement>) => {
+    const input = event.currentTarget;
+    if (input.value) send({ type: 'text', text: input.value });
+    input.value = '';
+  };
+
+  const relayKeyboardKey = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Backspace' || event.key === 'Enter' || event.key === 'Tab' || event.key === 'Escape') {
+      event.preventDefault();
+      send({ type: 'key', action: 'tap', key: event.key, modifiers: activeModifiers });
+      setActiveModifiers([]);
+    }
+  };
+
+  const openPhoneKeyboard = () => {
+    if (keyboardPanelEnabled) {
+      setKeyboardOpen(true);
+      window.setTimeout(() => keyboardInputRef.current?.focus(), 350);
+      return;
+    }
+    setNativeKeyboardActive(true);
+    quickKeyboardInputRef.current?.focus({ preventScroll: true });
+  };
+
   const connected = connectionState === 'connected';
   const statusText = connected
     ? stream ? 'Live' : 'Securing video'
@@ -948,15 +1026,20 @@ function RemoteSurface({
   } as CSSProperties;
 
   return (
-    <main className="remote-shell">
+    <main className={`remote-shell ${immersive ? 'is-immersive' : ''} ${immersive && !immersiveToolbarOpen ? 'controls-hidden' : ''} ${nativeKeyboardActive ? 'has-native-keyboard' : ''}`}>
       <header className="remote-topbar">
         <div className="min-w-0">
           <div className="flex items-center gap-2"><span className={`remote-state-dot ${connected ? 'is-live' : ''}`} /><strong className="truncate">{computerName}</strong></div>
           <p>{statusText} · {code.slice(0, 4)} {code.slice(4)}</p>
         </div>
-        <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => setControlsOpen(true)} aria-label="Open session controls">
-          <Menu className="size-5" />
-        </Button>
+        <div className="remote-topbar-actions">
+          <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => void setImmersiveMode(true)} aria-label="Enter fullscreen controller">
+            <Maximize2 className="size-5" />
+          </Button>
+          <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => setControlsOpen(true)} aria-label="Open session controls">
+            <Menu className="size-5" />
+          </Button>
+        </div>
       </header>
 
       <div className="remote-stage-wrap">
@@ -1001,11 +1084,11 @@ function RemoteSurface({
             {!connected && <span className="retry-note"><RefreshCw /> Retrying automatically</span>}
           </span>
         )}
-        {magnifierOpen && (
+        {magnifierVisible && (
           <span className={`precision-loupe ${cursorDisplay.x > 0.5 ? 'is-left' : 'is-right'}`} aria-live="polite">
             <canvas ref={magnifierCanvasRef} />
             <span className="loupe-crosshair" aria-hidden="true"><Crosshair /></span>
-            <strong>3× precision</strong>
+            <strong>{magnifierOpen ? '3× precision' : '3× magnifier'}</strong>
           </span>
         )}
         {stream && (
@@ -1032,8 +1115,8 @@ function RemoteSurface({
         <Button className="shortcut-button" onClick={() => send({ type: 'key', action: 'tap', key: 'v', modifiers: ['Control'] })}>
           <Clipboard /><span><small>Ctrl</small>V</span>
         </Button>
-        <Button variant="secondary" className="toolbar-button" onClick={() => { setKeyboardOpen(true); setTimeout(() => keyboardInputRef.current?.focus(), 350); }}>
-          <Keyboard /><span>Keys</span>
+        <Button variant="secondary" className="toolbar-button" onClick={openPhoneKeyboard}>
+          <Keyboard /><span>{keyboardPanelEnabled ? 'PC keys' : 'Type'}</span>
         </Button>
         <Button variant="secondary" className="toolbar-button" onClick={() => sendPointer('click')}>
           <MousePointerClick /><span>Click</span>
@@ -1042,6 +1125,69 @@ function RemoteSurface({
           <MousePointer2 /><span>Right</span>
         </Button>
       </nav>
+
+      {immersive && (
+        <>
+          <Button variant="secondary" size="icon-lg" className="immersive-exit" onClick={() => void setImmersiveMode(false)} aria-label="Exit fullscreen controller">
+            <Minimize2 />
+          </Button>
+          <Button
+            variant="secondary"
+            size="icon-lg"
+            className={`immersive-toolbar-toggle ${immersiveToolbarOpen ? 'is-raised' : ''}`}
+            onClick={() => setImmersiveToolbarOpen((open) => !open)}
+            aria-label={immersiveToolbarOpen ? 'Hide controller toolbar' : 'Show controller toolbar'}
+          >
+            {immersiveToolbarOpen ? <ChevronDown /> : <ChevronUp />}
+          </Button>
+        </>
+      )}
+
+      <div
+        className={`native-keyboard-capture ${nativeKeyboardActive ? 'is-active' : ''}`}
+        aria-label="Phone keyboard input"
+        aria-hidden={!nativeKeyboardActive}
+      >
+        <Keyboard aria-hidden="true" />
+        <Input
+          ref={quickKeyboardInputRef}
+          className="native-keyboard-input"
+          placeholder="Type directly to Windows…"
+          autoCapitalize="sentences"
+          autoCorrect="on"
+          tabIndex={nativeKeyboardActive ? 0 : -1}
+          onFocus={() => setNativeKeyboardActive(true)}
+          onInput={relayKeyboardInput}
+          onKeyDown={relayKeyboardKey}
+          onBlur={() => setNativeKeyboardActive(false)}
+        />
+        <button
+          type="button"
+          className="native-keyboard-special"
+          tabIndex={nativeKeyboardActive ? 0 : -1}
+          onPointerDown={(event) => event.preventDefault()}
+          onClick={() => {
+            quickKeyboardInputRef.current?.blur();
+            setNativeKeyboardActive(false);
+            setKeyboardOpen(true);
+          }}
+        >
+          PC keys
+        </button>
+        <button
+          type="button"
+          className="native-keyboard-close"
+          tabIndex={nativeKeyboardActive ? 0 : -1}
+          onPointerDown={(event) => event.preventDefault()}
+          onClick={() => {
+            quickKeyboardInputRef.current?.blur();
+            setNativeKeyboardActive(false);
+          }}
+          aria-label="Close phone keyboard"
+        >
+          <X />
+        </button>
+      </div>
 
       <Drawer open={keyboardOpen} onOpenChange={setKeyboardOpen} showSwipeHandle>
         <DrawerContent className="keyboard-drawer">
@@ -1056,18 +1202,8 @@ function RemoteSurface({
               placeholder="Tap here, then type…"
               autoCapitalize="sentences"
               autoCorrect="on"
-              onInput={(event) => {
-                const input = event.currentTarget;
-                if (input.value) send({ type: 'text', text: input.value });
-                input.value = '';
-              }}
-              onKeyDown={(event: ReactKeyboardEvent<HTMLInputElement>) => {
-                if (event.key === 'Backspace' || event.key === 'Enter' || event.key === 'Tab' || event.key === 'Escape') {
-                  event.preventDefault();
-                  send({ type: 'key', action: 'tap', key: event.key, modifiers: activeModifiers });
-                  setActiveModifiers([]);
-                }
-              }}
+              onInput={relayKeyboardInput}
+              onKeyDown={relayKeyboardKey}
             />
             <fieldset className="pc-keyboard" aria-label="Full PC keyboard">
               {keyRows.map((row, rowIndex) => (
@@ -1102,9 +1238,27 @@ function RemoteSurface({
         <DrawerContent className="control-drawer">
           <DrawerHeader className="text-left">
             <DrawerTitle>Session controls</DrawerTitle>
-            <DrawerDescription>Pointer feel, connection, keep-awake, and computer power.</DrawerDescription>
+            <DrawerDescription>Screen space, pointer feel, keyboard, connection, and computer power.</DrawerDescription>
           </DrawerHeader>
           <div className="control-list">
+            <div className="control-section-label">View</div>
+            <div className="control-row">
+              <span className="control-row-icon"><Maximize2 /></span>
+              <span><strong>Immersive fullscreen</strong><small>Hide the top bar; reveal the bottom controls when needed</small></span>
+              <Switch
+                checked={immersive}
+                onCheckedChange={(checked) => {
+                  setControlsOpen(false);
+                  void setImmersiveMode(checked);
+                }}
+                aria-label="Toggle immersive fullscreen"
+              />
+            </div>
+            <div className="control-row">
+              <span className="control-row-icon"><Crosshair /></span>
+              <span><strong>Permanent magnifier</strong><small>Keep the 3× crosshair view visible while moving</small></span>
+              <Switch checked={magnifierPinned} onCheckedChange={setMagnifierPinned} aria-label="Always show precision magnifier" />
+            </div>
             <div className="control-section-label">Pointer</div>
             <div className="control-row">
               <span className="control-row-icon"><Hand /></span>
@@ -1134,6 +1288,24 @@ function RemoteSurface({
                 <span className="control-row-icon"><ZoomOut /></span><span><strong>Reset screen zoom</strong><small>Return to the full desktop view</small></span><ArrowRight />
               </button>
             )}
+            <div className="control-section-label">Keyboard</div>
+            <div className="control-row">
+              <span className="control-row-icon"><Keyboard /></span>
+              <span><strong>Show full PC key panel</strong><small>When off, Type opens only your phone keyboard</small></span>
+              <Switch
+                checked={keyboardPanelEnabled}
+                onCheckedChange={(checked) => {
+                  setKeyboardPanelEnabled(checked);
+                  if (checked) {
+                    quickKeyboardInputRef.current?.blur();
+                    setNativeKeyboardActive(false);
+                  } else {
+                    setKeyboardOpen(false);
+                  }
+                }}
+                aria-label="Open the full PC key panel from the keyboard button"
+              />
+            </div>
             <div className="control-section-label">Session</div>
             {!connected && (
               <button type="button" className="control-row" onClick={reconnect}>
