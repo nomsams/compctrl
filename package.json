@@ -15,6 +15,7 @@
     "companion": "electron companion/main.cjs",
     "pack:windows": "npm run build && electron-builder --win nsis portable",
     "start": "wrangler dev --config dist/server/wrangler.json",
+    "test:geometry": "node --experimental-strip-types --test lib/remote-geometry.test.ts",
     "lint": "oxlint app lib",
     "format": "oxfmt"
   },

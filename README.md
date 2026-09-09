@@ -35,9 +35,12 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 
 ## Controls
 
-- Touch the point on the live screen where the Windows pointer should go. Tap to click and drag to drag.
+- The live screen acts like a touchpad by default: swipe anywhere to move the large on-screen pointer, then tap or use the dedicated left/right click buttons.
+- Hold one finger still to open the 3× precision magnifier. Move while holding to line up its crosshair, then release; the pointer stays put without clicking.
+- Pinch with two fingers to zoom the live view up to 4×. The mapping remains aligned after phone orientation changes, and the visible zoom chip restores the full-screen view.
 - **Scan QR code** opens the phone's rear camera and connects from the QR code displayed in the Windows companion.
 - Drag with two fingers to scroll.
+- Open session controls to switch between touchpad and direct-touch positioning, change pointer speed, disable tap-to-click, or enable drag/select. Drag/select is off by default to prevent accidental text selection.
 - Use the always-visible **Ctrl+C** and **Ctrl+V** buttons for clipboard shortcuts.
 - **Keys** opens a phone typing field plus every standard PC key, function keys, modifiers, navigation keys, and arrows.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.

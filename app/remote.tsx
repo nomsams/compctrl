@@ -5,7 +5,9 @@ import {
   Camera,
   Clipboard,
   Copy,
+  Crosshair,
   Gauge,
+  Hand,
   Keyboard,
   Menu,
   Monitor,
@@ -19,6 +21,7 @@ import {
   Unplug,
   WifiOff,
   X,
+  ZoomOut,
 } from 'lucide-react';
 import type { DataConnection, MediaConnection } from 'peerjs';
 import type QrScanner from 'qr-scanner';
@@ -52,8 +55,21 @@ import {
   DrawerTitle,
 } from '@/components/ui/drawer';
 import { Input } from '@/components/ui/input';
+import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { newPeer } from '@/lib/peer';
+import {
+  MAX_VIEW_SCALE,
+  clamp,
+  clampPoint,
+  containedRect,
+  displayToScreen,
+  screenToDisplay,
+  type RemotePoint,
+  type RemoteRect,
+  type RemoteView,
+  viewAroundAnchor,
+} from '@/lib/remote-geometry';
 import {
   CODE_LENGTH,
   type ConnectionState,
@@ -537,33 +553,193 @@ function RemoteSurface({
   reconnect,
 }: RemoteSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const stageRef = useRef<HTMLButtonElement>(null);
+  const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
   const keyboardInputRef = useRef<HTMLInputElement>(null);
   const pointerState = useRef({
-    points: new Map<number, { clientX: number; clientY: number }>(),
+    points: new Map<number, {
+      clientX: number;
+      clientY: number;
+      startX: number;
+      startY: number;
+    }>(),
     mouseDown: false,
     pressTimer: 0 as number | ReturnType<typeof setTimeout>,
-    lastScrollY: 0,
-    lastX: 0.5,
-    lastY: 0.5,
+    primaryId: null as number | null,
+    moved: false,
+    suppressTap: false,
+    longPressed: false,
+    cursor: { x: 0.5, y: 0.5 } as RemotePoint,
+    multi: null as null | {
+      mode: 'pending' | 'pinch' | 'scroll';
+      startDistance: number;
+      startMidpoint: RemotePoint;
+      lastMidpoint: RemotePoint;
+      startZoom: number;
+      anchorScreen: RemotePoint;
+      movedPointers: Set<number>;
+    },
   });
+  const contentBoxRef = useRef<RemoteRect>({ left: 0, top: 0, width: 0, height: 0 });
+  const viewRef = useRef<RemoteView>({ scale: 1, centerX: 0.5, centerY: 0.5 });
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [controlsOpen, setControlsOpen] = useState(false);
   const [powerAction, setPowerAction] = useState<'restart' | 'shutdown' | null>(null);
   const [activeModifiers, setActiveModifiers] = useState<Modifier[]>([]);
+  const [cursor, setCursor] = useState<RemotePoint>({ x: 0.5, y: 0.5 });
+  const [contentBox, setContentBox] = useState<RemoteRect>({ left: 0, top: 0, width: 0, height: 0 });
+  const [view, setView] = useState<RemoteView>({ scale: 1, centerX: 0.5, centerY: 0.5 });
+  const [magnifierOpen, setMagnifierOpen] = useState(false);
+  const [pointerMode, setPointerMode] = useState<'touchpad' | 'direct'>(() => {
+    if (typeof window === 'undefined') return 'touchpad';
+    return window.localStorage.getItem('compctrl.pointerMode') === 'direct' ? 'direct' : 'touchpad';
+  });
+  const [dragSelectionEnabled, setDragSelectionEnabled] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return window.localStorage.getItem('compctrl.dragSelection') === 'true';
+  });
+  const [tapToClick, setTapToClick] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return window.localStorage.getItem('compctrl.tapToClick') !== 'false';
+  });
+  const [sensitivity, setSensitivity] = useState(() => {
+    if (typeof window === 'undefined') return 1.25;
+    return clamp(Number(window.localStorage.getItem('compctrl.sensitivity')) || 1.25, 0.6, 2);
+  });
+
+  const vibrate = useCallback((duration = 18) => {
+    if ('vibrate' in navigator) navigator.vibrate(duration);
+  }, []);
+
+  const updateView = useCallback((next: RemoteView) => {
+    viewRef.current = next;
+    setView(next);
+  }, []);
+
+  const measureStage = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const video = videoRef.current;
+    const next = containedRect(
+      stage.clientWidth,
+      stage.clientHeight,
+      video?.videoWidth || 16,
+      video?.videoHeight || 9,
+    );
+    contentBoxRef.current = next;
+    setContentBox((current) => (
+      Math.abs(current.left - next.left) < 0.5
+      && Math.abs(current.top - next.top) < 0.5
+      && Math.abs(current.width - next.width) < 0.5
+      && Math.abs(current.height - next.height) < 0.5
+        ? current
+        : next
+    ));
+  }, []);
+
+  const sendPointerAt = useCallback((action: 'move' | 'down' | 'up' | 'click', point: RemotePoint, button: 'left' | 'right' = 'left') => {
+    send({ type: 'pointer', action, x: point.x, y: point.y, button });
+  }, [send]);
+
+  const moveCursor = useCallback((point: RemotePoint) => {
+    const next = clampPoint(point);
+    pointerState.current.cursor = next;
+    setCursor(next);
+    sendPointerAt('move', next);
+    return next;
+  }, [sendPointerAt]);
+
+  const endActiveGesture = useCallback(() => {
+    const state = pointerState.current;
+    if (state.pressTimer) clearTimeout(state.pressTimer);
+    state.pressTimer = 0;
+    if (state.mouseDown) sendPointerAt('up', state.cursor);
+    state.points.clear();
+    state.mouseDown = false;
+    state.primaryId = null;
+    state.moved = false;
+    state.suppressTap = false;
+    state.longPressed = false;
+    state.multi = null;
+    setMagnifierOpen(false);
+  }, [sendPointerAt]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     video.srcObject = stream;
     if (stream) void video.play().catch(() => undefined);
-  }, [stream]);
+    measureStage();
+    video.addEventListener('resize', measureStage);
+    return () => video.removeEventListener('resize', measureStage);
+  }, [measureStage, stream]);
 
   useEffect(() => {
-    const pointer = pointerState.current;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const observer = new ResizeObserver(measureStage);
+    observer.observe(stage);
+    window.addEventListener('resize', measureStage);
+    window.addEventListener('orientationchange', endActiveGesture);
     return () => {
-      if (pointer.pressTimer) clearTimeout(pointer.pressTimer);
+      observer.disconnect();
+      window.removeEventListener('resize', measureStage);
+      window.removeEventListener('orientationchange', endActiveGesture);
     };
-  }, []);
+  }, [endActiveGesture, measureStage]);
+
+  useEffect(() => () => endActiveGesture(), [endActiveGesture]);
+
+  useEffect(() => {
+    window.localStorage.setItem('compctrl.pointerMode', pointerMode);
+    window.localStorage.setItem('compctrl.dragSelection', String(dragSelectionEnabled));
+    window.localStorage.setItem('compctrl.tapToClick', String(tapToClick));
+    window.localStorage.setItem('compctrl.sensitivity', String(sensitivity));
+  }, [dragSelectionEnabled, pointerMode, sensitivity, tapToClick]);
+
+  useEffect(() => {
+    if (!magnifierOpen) return;
+    let frame = 0;
+    const draw = () => {
+      const video = videoRef.current;
+      const canvas = magnifierCanvasRef.current;
+      const box = contentBoxRef.current;
+      if (video && canvas && video.readyState >= 2 && video.videoWidth && box.width) {
+        const cssSize = 176;
+        const ratio = Math.min(window.devicePixelRatio || 1, 2);
+        const pixelSize = Math.round(cssSize * ratio);
+        if (canvas.width !== pixelSize || canvas.height !== pixelSize) {
+          canvas.width = pixelSize;
+          canvas.height = pixelSize;
+        }
+        const cropWidth = Math.min(video.videoWidth, video.videoWidth * cssSize / (box.width * 3));
+        const cropHeight = Math.min(video.videoHeight, video.videoHeight * cssSize / (box.height * 3));
+        const desiredX = pointerState.current.cursor.x * video.videoWidth - cropWidth / 2;
+        const desiredY = pointerState.current.cursor.y * video.videoHeight - cropHeight / 2;
+        const sourceX = clamp(desiredX, 0, video.videoWidth);
+        const sourceY = clamp(desiredY, 0, video.videoHeight);
+        const sourceRight = clamp(desiredX + cropWidth, 0, video.videoWidth);
+        const sourceBottom = clamp(desiredY + cropHeight, 0, video.videoHeight);
+        const sourceWidth = Math.max(0, sourceRight - sourceX);
+        const sourceHeight = Math.max(0, sourceBottom - sourceY);
+        const destinationX = (sourceX - desiredX) / cropWidth * pixelSize;
+        const destinationY = (sourceY - desiredY) / cropHeight * pixelSize;
+        const destinationWidth = sourceWidth / cropWidth * pixelSize;
+        const destinationHeight = sourceHeight / cropHeight * pixelSize;
+        const context = canvas.getContext('2d');
+        if (context) {
+          context.fillStyle = '#080b11';
+          context.fillRect(0, 0, pixelSize, pixelSize);
+          if (sourceWidth && sourceHeight) {
+            context.drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, destinationX, destinationY, destinationWidth, destinationHeight);
+          }
+        }
+      }
+      frame = requestAnimationFrame(draw);
+    };
+    frame = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(frame);
+  }, [magnifierOpen]);
 
   const handleHardwareKey = (event: ReactKeyboardEvent<HTMLButtonElement>, action: 'down' | 'up') => {
     if (event.nativeEvent.isComposing || event.key === 'Unidentified') return;
@@ -571,94 +747,174 @@ function RemoteSurface({
     send({ type: 'key', action: event.repeat ? 'tap' : action, key: event.key });
   };
 
-  const normalizedPoint = useCallback((event: ReactPointerEvent<HTMLElement>) => {
-    const video = videoRef.current;
-    const element = event.currentTarget;
-    const rect = element.getBoundingClientRect();
-    const videoWidth = video?.videoWidth || 16;
-    const videoHeight = video?.videoHeight || 9;
-    const contentRatio = videoWidth / videoHeight;
-    const boxRatio = rect.width / rect.height;
-    let width = rect.width;
-    let height = rect.height;
-    let left = rect.left;
-    let top = rect.top;
-    if (boxRatio > contentRatio) {
-      width = rect.height * contentRatio;
-      left += (rect.width - width) / 2;
-    } else {
-      height = rect.width / contentRatio;
-      top += (rect.height - height) / 2;
-    }
+  const sendPointer = useCallback((action: 'move' | 'down' | 'up' | 'click', button: 'left' | 'right' = 'left') => {
+    sendPointerAt(action, pointerState.current.cursor, button);
+    if (action === 'click') vibrate();
+  }, [sendPointerAt, vibrate]);
+
+  const clientToDisplay = useCallback((clientX: number, clientY: number): RemotePoint => {
+    const stageRect = stageRef.current?.getBoundingClientRect();
+    const box = contentBoxRef.current;
+    if (!stageRect || !box.width || !box.height) return { x: 0.5, y: 0.5 };
     return {
-      x: Math.max(0, Math.min(1, (event.clientX - left) / width)),
-      y: Math.max(0, Math.min(1, (event.clientY - top) / height)),
+      x: (clientX - stageRect.left - box.left) / box.width,
+      y: (clientY - stageRect.top - box.top) / box.height,
     };
   }, []);
 
-  const sendPointer = useCallback((action: 'move' | 'down' | 'up' | 'click', button: 'left' | 'right' = 'left') => {
+  const midpointForPoints = (points: Array<{ clientX: number; clientY: number }>) => ({
+    x: points.reduce((sum, point) => sum + point.clientX, 0) / points.length,
+    y: points.reduce((sum, point) => sum + point.clientY, 0) / points.length,
+  });
+
+  const beginMultiGesture = () => {
     const state = pointerState.current;
-    send({ type: 'pointer', action, x: state.lastX, y: state.lastY, button });
-  }, [send]);
+    const points = Array.from(state.points.values()).slice(0, 2);
+    if (points.length < 2) return;
+    const midpoint = midpointForPoints(points);
+    const distance = Math.hypot(points[1].clientX - points[0].clientX, points[1].clientY - points[0].clientY);
+    state.multi = {
+      mode: 'pending',
+      startDistance: Math.max(distance, 1),
+      startMidpoint: midpoint,
+      lastMidpoint: midpoint,
+      startZoom: viewRef.current.scale,
+      anchorScreen: displayToScreen(clientToDisplay(midpoint.x, midpoint.y), viewRef.current),
+      movedPointers: new Set(),
+    };
+  };
 
   const onPointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
     event.currentTarget.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
-    const point = normalizedPoint(event);
     const state = pointerState.current;
-    state.points.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
-    state.lastX = point.x;
-    state.lastY = point.y;
-    send({ type: 'pointer', action: 'move', ...point });
+    state.points.set(event.pointerId, {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      startX: event.clientX,
+      startY: event.clientY,
+    });
     if (state.points.size === 1) {
+      state.primaryId = event.pointerId;
+      state.moved = false;
+      state.suppressTap = false;
+      state.longPressed = false;
+      if (pointerMode === 'direct') {
+        moveCursor(displayToScreen(clientToDisplay(event.clientX, event.clientY), viewRef.current));
+      }
       state.pressTimer = window.setTimeout(() => {
-        if (state.points.size === 1) {
-          state.mouseDown = true;
-          sendPointer('down');
+        if (state.points.size === 1 && !state.moved) {
+          state.longPressed = true;
+          setMagnifierOpen(true);
+          vibrate(28);
         }
-      }, 90);
+      }, 420);
     } else {
       clearTimeout(state.pressTimer);
-      if (state.mouseDown) sendPointer('up');
+      state.pressTimer = 0;
+      if (state.mouseDown) sendPointerAt('up', state.cursor);
       state.mouseDown = false;
-      state.lastScrollY = Array.from(state.points.values()).reduce((sum, p) => sum + p.clientY, 0) / state.points.size;
+      state.longPressed = false;
+      state.moved = true;
+      state.suppressTap = true;
+      setMagnifierOpen(false);
+      beginMultiGesture();
     }
   };
 
   const onPointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    event.preventDefault();
     const state = pointerState.current;
     const previous = state.points.get(event.pointerId);
     if (!previous) return;
-    state.points.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    const current = { ...previous, clientX: event.clientX, clientY: event.clientY };
+    state.points.set(event.pointerId, current);
     if (state.points.size >= 2) {
-      const averageY = Array.from(state.points.values()).reduce((sum, p) => sum + p.clientY, 0) / state.points.size;
-      const deltaY = (state.lastScrollY - averageY) * 2.2;
-      state.lastScrollY = averageY;
-      if (Math.abs(deltaY) > 0.5) send({ type: 'wheel', deltaX: 0, deltaY });
+      if (!state.multi) beginMultiGesture();
+      const multi = state.multi;
+      const points = Array.from(state.points.values()).slice(0, 2);
+      if (!multi || points.length < 2) return;
+      const midpoint = midpointForPoints(points);
+      const distance = Math.hypot(points[1].clientX - points[0].clientX, points[1].clientY - points[0].clientY);
+      const spreadChange = Math.abs(distance - multi.startDistance);
+      const midpointTravel = Math.hypot(midpoint.x - multi.startMidpoint.x, midpoint.y - multi.startMidpoint.y);
+      multi.movedPointers.add(event.pointerId);
+      if (multi.mode === 'pending' && multi.movedPointers.size >= 2 && (spreadChange > 7 || midpointTravel > 8)) {
+        multi.mode = spreadChange > midpointTravel * 0.7 ? 'pinch' : 'scroll';
+      }
+      if (multi.mode === 'pinch') {
+        const nextScale = clamp(multi.startZoom * distance / multi.startDistance, 1, MAX_VIEW_SCALE);
+        updateView(viewAroundAnchor(nextScale, multi.anchorScreen, clientToDisplay(midpoint.x, midpoint.y)));
+      } else if (multi.mode === 'scroll') {
+        const deltaX = (multi.lastMidpoint.x - midpoint.x) * 1.35;
+        const deltaY = (multi.lastMidpoint.y - midpoint.y) * 2.2;
+        if (Math.abs(deltaX) > 0.4 || Math.abs(deltaY) > 0.4) send({ type: 'wheel', deltaX, deltaY });
+      }
+      multi.lastMidpoint = midpoint;
       return;
     }
-    const point = normalizedPoint(event);
-    state.lastX = point.x;
-    state.lastY = point.y;
-    if (!state.mouseDown && Math.hypot(event.clientX - previous.clientX, event.clientY - previous.clientY) > 3) {
-      clearTimeout(state.pressTimer);
-      state.mouseDown = true;
-      send({ type: 'pointer', action: 'down', ...point, button: 'left' });
+
+    if (state.primaryId !== event.pointerId) return;
+    const totalMovement = Math.hypot(event.clientX - current.startX, event.clientY - current.startY);
+    if (totalMovement > 6) {
+      state.moved = true;
+      if (!state.longPressed) {
+        clearTimeout(state.pressTimer);
+        state.pressTimer = 0;
+      }
     }
-    send({ type: 'pointer', action: 'move', ...point });
+    if (dragSelectionEnabled && state.moved && !state.longPressed && !state.mouseDown) {
+      state.mouseDown = true;
+      sendPointerAt('down', state.cursor);
+    }
+
+    let next: RemotePoint;
+    if (pointerMode === 'direct' && !state.longPressed) {
+      next = displayToScreen(clientToDisplay(event.clientX, event.clientY), viewRef.current);
+    } else {
+      const box = contentBoxRef.current;
+      const speed = state.longPressed ? 0.32 : sensitivity;
+      next = {
+        x: state.cursor.x + (event.clientX - previous.clientX) / Math.max(box.width, 1) * speed,
+        y: state.cursor.y + (event.clientY - previous.clientY) / Math.max(box.height, 1) * speed,
+      };
+    }
+    moveCursor(next);
   };
 
-  const onPointerUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
+  const finishPointer = (event: ReactPointerEvent<HTMLButtonElement>, cancelled = false) => {
+    event.preventDefault();
     const state = pointerState.current;
-    const wasSingle = state.points.size === 1;
+    const wasPrimarySingle = state.points.size === 1 && state.primaryId === event.pointerId;
     state.points.delete(event.pointerId);
-    if (wasSingle) {
+    if (wasPrimarySingle) {
       clearTimeout(state.pressTimer);
-      if (state.mouseDown) sendPointer('up');
-      else sendPointer('click');
+      state.pressTimer = 0;
+      if (state.mouseDown) sendPointerAt('up', state.cursor);
+      else if (!cancelled && !state.longPressed && !state.moved && !state.suppressTap && tapToClick) sendPointer('click');
       state.mouseDown = false;
-    } else if (state.points.size === 1) {
-      state.lastScrollY = Array.from(state.points.values())[0]?.clientY ?? 0;
+      state.primaryId = null;
+      state.longPressed = false;
+      state.moved = false;
+      state.suppressTap = false;
+      state.multi = null;
+      setMagnifierOpen(false);
+      return;
+    }
+
+    state.multi = null;
+    if (state.points.size === 1) {
+      const [remainingId, remaining] = Array.from(state.points.entries())[0];
+      remaining.startX = remaining.clientX;
+      remaining.startY = remaining.clientY;
+      state.primaryId = remainingId;
+      state.moved = false;
+      state.suppressTap = true;
+    } else {
+      state.primaryId = null;
+      state.moved = false;
+      state.suppressTap = false;
     }
   };
 
@@ -679,6 +935,17 @@ function RemoteSurface({
   const statusText = connected
     ? stream ? 'Live' : 'Securing video'
     : connectionState === 'offline' ? 'Phone offline' : retryCount ? `Reconnecting · ${retryCount}` : 'Connecting';
+  const cursorDisplay = screenToDisplay(cursor, view);
+  const cursorVisible = cursorDisplay.x >= 0 && cursorDisplay.x <= 1 && cursorDisplay.y >= 0 && cursorDisplay.y <= 1;
+  const videoStyle = {
+    transform: `matrix(${view.scale}, 0, 0, ${view.scale}, ${contentBox.width * (0.5 - view.scale * view.centerX)}, ${contentBox.height * (0.5 - view.scale * view.centerY)})`,
+  } as CSSProperties;
+  const viewportStyle = {
+    left: contentBox.left,
+    top: contentBox.top,
+    width: contentBox.width,
+    height: contentBox.height,
+  } as CSSProperties;
 
   return (
     <main className="remote-shell">
@@ -692,19 +959,40 @@ function RemoteSurface({
         </Button>
       </header>
 
-      <button
-        type="button"
-        className="remote-video-stage"
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerUp}
-        onPointerCancel={onPointerUp}
-        onKeyDown={(event) => handleHardwareKey(event, 'down')}
-        onKeyUp={(event) => handleHardwareKey(event, 'up')}
-        onContextMenu={(event) => event.preventDefault()}
-        aria-label="Remote computer screen. Touch a point to move and click there; drag with two fingers to scroll."
-      >
-        <video ref={videoRef} autoPlay muted playsInline className={`remote-video ${stream ? 'is-visible' : ''}`} />
+      <div className="remote-stage-wrap">
+        <button
+          ref={stageRef}
+          type="button"
+          className="remote-video-stage"
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={(event) => finishPointer(event)}
+          onPointerCancel={(event) => finishPointer(event, true)}
+          onKeyDown={(event) => handleHardwareKey(event, 'down')}
+          onKeyUp={(event) => handleHardwareKey(event, 'up')}
+          onContextMenu={(event) => event.preventDefault()}
+          aria-label="Remote computer touchpad. Swipe to move, tap to click, hold for a magnified precision view, use two fingers to scroll, or pinch to zoom."
+        >
+        <span className="remote-video-viewport" style={viewportStyle}>
+          <video
+            ref={videoRef}
+            autoPlay
+            muted
+            playsInline
+            className={`remote-video ${stream ? 'is-visible' : ''}`}
+            style={videoStyle}
+            onLoadedMetadata={measureStage}
+          />
+          {stream && cursorVisible && (
+            <span
+              className={`remote-cursor ${magnifierOpen ? 'is-precision' : ''}`}
+              style={{ left: `${cursorDisplay.x * 100}%`, top: `${cursorDisplay.y * 100}%` }}
+              aria-hidden="true"
+            >
+              <MousePointer2 />
+            </span>
+          )}
+        </span>
         {!stream && (
           <span className="remote-empty">
             {connected ? <Monitor className="size-8" /> : <WifiOff className="size-8" />}
@@ -713,8 +1001,29 @@ function RemoteSurface({
             {!connected && <span className="retry-note"><RefreshCw /> Retrying automatically</span>}
           </span>
         )}
-        {stream && <span className="touch-hint">Tap anywhere · drag to move · two fingers to scroll</span>}
-      </button>
+        {magnifierOpen && (
+          <span className={`precision-loupe ${cursorDisplay.x > 0.5 ? 'is-left' : 'is-right'}`} aria-live="polite">
+            <canvas ref={magnifierCanvasRef} />
+            <span className="loupe-crosshair" aria-hidden="true"><Crosshair /></span>
+            <strong>3× precision</strong>
+          </span>
+        )}
+        {stream && (
+          <span className="touch-hint">
+            {pointerMode === 'touchpad' ? 'Swipe to move' : 'Touch to position'} · Hold for 3× precision · Pinch to zoom
+          </span>
+        )}
+        </button>
+        {stream && view.scale > 1.01 && (
+          <button
+            type="button"
+            className="view-zoom-reset"
+            onClick={() => updateView({ scale: 1, centerX: 0.5, centerY: 0.5 })}
+          >
+            <ZoomOut /> {view.scale.toFixed(1)}× · Reset
+          </button>
+        )}
+      </div>
 
       <nav className="remote-toolbar" aria-label="Remote control shortcuts">
         <Button className="shortcut-button" onClick={() => send({ type: 'key', action: 'tap', key: 'c', modifiers: ['Control'] })}>
@@ -793,9 +1102,39 @@ function RemoteSurface({
         <DrawerContent className="control-drawer">
           <DrawerHeader className="text-left">
             <DrawerTitle>Session controls</DrawerTitle>
-            <DrawerDescription>Connection, keep-awake, and computer power.</DrawerDescription>
+            <DrawerDescription>Pointer feel, connection, keep-awake, and computer power.</DrawerDescription>
           </DrawerHeader>
           <div className="control-list">
+            <div className="control-section-label">Pointer</div>
+            <div className="control-row">
+              <span className="control-row-icon"><Hand /></span>
+              <span><strong>Touchpad mode</strong><small>Swipe anywhere to move the pointer relatively</small></span>
+              <Switch checked={pointerMode === 'touchpad'} onCheckedChange={(checked) => setPointerMode(checked ? 'touchpad' : 'direct')} aria-label="Use touchpad mode" />
+            </div>
+            <div className="control-row">
+              <span className="control-row-icon"><MousePointerClick /></span>
+              <span><strong>Tap to click</strong><small>Two quick taps work as a double-click</small></span>
+              <Switch checked={tapToClick} onCheckedChange={setTapToClick} aria-label="Toggle tap to click" />
+            </div>
+            <div className="control-row">
+              <span className="control-row-icon"><Crosshair /></span>
+              <span><strong>Drag and select</strong><small>Hold the Windows mouse button while swiping</small></span>
+              <Switch checked={dragSelectionEnabled} onCheckedChange={setDragSelectionEnabled} aria-label="Toggle drag and text selection" />
+            </div>
+            <div className="control-row control-slider-row">
+              <span className="control-row-icon"><Gauge /></span>
+              <span><strong>Pointer speed</strong><small>Long-press precision always stays slow</small></span>
+              <span className="pointer-speed-control">
+                <output>{sensitivity.toFixed(1)}×</output>
+                <Slider value={[sensitivity]} min={0.6} max={2} step={0.1} onValueChange={(value) => setSensitivity(typeof value === 'number' ? value : value[0] ?? 1.25)} aria-label="Pointer speed" />
+              </span>
+            </div>
+            {view.scale > 1.01 && (
+              <button type="button" className="control-row" onClick={() => updateView({ scale: 1, centerX: 0.5, centerY: 0.5 })}>
+                <span className="control-row-icon"><ZoomOut /></span><span><strong>Reset screen zoom</strong><small>Return to the full desktop view</small></span><ArrowRight />
+              </button>
+            )}
+            <div className="control-section-label">Session</div>
             {!connected && (
               <button type="button" className="control-row" onClick={reconnect}>
                 <span className="control-row-icon"><RefreshCw /></span><span><strong>Retry connection</strong><small>Start a fresh rendezvous now</small></span><ArrowRight />
