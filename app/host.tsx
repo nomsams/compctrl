@@ -282,11 +282,22 @@ export function HostController() {
           </div>
           <div className="qr-panel">
             {pairingUrl ? (
-              <QRCodeSVG value={pairingUrl} size={188} bgColor="#ffffff" fgColor="#141923" level="M" marginSize={2} />
+              <>
+                <strong className="qr-title">Scan to connect</strong>
+                <QRCodeSVG
+                  value={pairingUrl}
+                  title={`CompCtrl pairing code ${pairingCode}`}
+                  size={188}
+                  bgColor="#ffffff"
+                  fgColor="#141923"
+                  level="M"
+                  marginSize={2}
+                />
+              </>
             ) : (
               <div className="qr-placeholder"><Link2 /><span>Add your GitHub Pages address below to enable QR pairing.</span></div>
             )}
-            <small>{pairingUrl ? 'Scan with your phone camera' : 'Manual code pairing still works'}</small>
+            <small>{pairingUrl ? 'On your phone, tap Scan QR code and point the camera here' : 'Manual code pairing still works'}</small>
           </div>
         </div>
 

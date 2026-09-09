@@ -2,6 +2,7 @@
 
 import {
   ArrowRight,
+  Camera,
   Clipboard,
   Copy,
   Gauge,
@@ -13,11 +14,14 @@ import {
   Power,
   RefreshCw,
   RotateCcw,
+  ScanLine,
   ShieldCheck,
   Unplug,
   WifiOff,
+  X,
 } from 'lucide-react';
 import type { DataConnection, MediaConnection } from 'peerjs';
+import type QrScanner from 'qr-scanner';
 import {
   type ChangeEvent,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -56,6 +60,7 @@ import {
   type ControllerMessage,
   type HostMessage,
   cleanCode,
+  pairingCodeFromQr,
   peerIdForCode,
 } from '@/lib/protocol';
 
@@ -117,6 +122,20 @@ function readInitialCode() {
   return cleanCode(window.localStorage.getItem('compctrl.lastCode') ?? '');
 }
 
+function cameraErrorMessage(error: unknown) {
+  const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  if (/notallowed|permission|denied/i.test(message)) {
+    return 'Camera access was blocked. Allow camera access in your browser settings, then try again.';
+  }
+  if (/notfound|no camera|devicesnotfound/i.test(message)) {
+    return 'No camera was found on this device. You can still enter the pairing code manually.';
+  }
+  if (!window.isSecureContext) {
+    return 'Camera scanning requires HTTPS. Open the published GitHub Pages address and try again.';
+  }
+  return 'The camera could not start. Close other camera apps, then try again.';
+}
+
 export function RemoteController() {
   const [code, setCode] = useState('');
   const [sessionCode, setSessionCode] = useState<string | null>(null);
@@ -126,9 +145,13 @@ export function RemoteController() {
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [computerName, setComputerName] = useState('Windows PC');
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
+  const [scannerOpen, setScannerOpen] = useState(false);
+  const [scannerStatus, setScannerStatus] = useState('Starting camera…');
   const connectionRef = useRef<DataConnection | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
   const lastPongRef = useRef(0);
+  const scannerVideoRef = useRef<HTMLVideoElement>(null);
+  const scannerRef = useRef<QrScanner | null>(null);
 
   useEffect(() => {
     const initial = readInitialCode();
@@ -145,6 +168,64 @@ export function RemoteController() {
     void connection.send(message);
     return true;
   }, []);
+
+  const beginSession = useCallback((value: string) => {
+    const nextCode = cleanCode(value);
+    if (nextCode.length !== CODE_LENGTH) return false;
+    setCode(nextCode);
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${nextCode}`);
+    setSessionCode(nextCode);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (!scannerOpen || sessionCode) return;
+    let disposed = false;
+
+    const startScanner = async () => {
+      setScannerStatus('Starting camera…');
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('No camera API');
+        const { default: Scanner } = await import('qr-scanner');
+        if (disposed || !scannerVideoRef.current) return;
+        if (!(await Scanner.hasCamera())) throw new Error('No camera found');
+
+        const scanner = new Scanner(
+          scannerVideoRef.current,
+          (result) => {
+            const scannedCode = pairingCodeFromQr(result.data);
+            if (!scannedCode) {
+              setScannerStatus('That is not a CompCtrl pairing QR code. Point at the code shown on your computer.');
+              return;
+            }
+            scanner.stop();
+            setScannerOpen(false);
+            beginSession(scannedCode);
+          },
+          {
+            preferredCamera: 'environment',
+            maxScansPerSecond: 10,
+            highlightScanRegion: true,
+            highlightCodeOutline: true,
+            returnDetailedScanResult: true,
+          },
+        );
+        scannerRef.current = scanner;
+        await scanner.start();
+        if (!disposed) setScannerStatus('Point your camera at the QR code in the Windows companion.');
+      } catch (error) {
+        if (!disposed) setScannerStatus(cameraErrorMessage(error));
+      }
+    };
+
+    void startScanner();
+    return () => {
+      disposed = true;
+      scannerRef.current?.stop();
+      scannerRef.current?.destroy();
+      scannerRef.current = null;
+    };
+  }, [beginSession, scannerOpen, sessionCode]);
 
   useEffect(() => {
     if (!sessionCode) return;
@@ -258,12 +339,7 @@ export function RemoteController() {
     };
   }, [reconnectNonce, send, sessionCode]);
 
-  const startSession = () => {
-    const nextCode = cleanCode(code);
-    if (nextCode.length !== CODE_LENGTH) return;
-    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${nextCode}`);
-    setSessionCode(nextCode);
-  };
+  const startSession = () => { beginSession(code); };
 
   useEffect(() => {
     const context = document.modelContext;
@@ -283,14 +359,12 @@ export function RemoteController() {
       execute(input) {
         const candidate = cleanCode((input as { code?: unknown })?.code as string ?? '');
         if (candidate.length !== CODE_LENGTH) throw new Error('A valid eight-character pairing code is required.');
-        setCode(candidate);
-        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${candidate}`);
-        setSessionCode(candidate);
+        beginSession(candidate);
         return { status: 'connecting', code: `${candidate.slice(0, 4)} ${candidate.slice(4)}` };
       },
     }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
-  }, []);
+  }, [beginSession]);
 
   const disconnect = () => {
     window.localStorage.removeItem('compctrl.autoReconnect');
@@ -368,6 +442,12 @@ export function RemoteController() {
                 <ArrowRight className="size-5" />
               </Button>
             </div>
+            <div className="pairing-secondary">
+              <Button type="button" variant="outline" className="scan-code-button" onClick={() => setScannerOpen(true)}>
+                <Camera className="size-[18px]" /> Scan QR code
+              </Button>
+              <span>or enter the 8-character code</span>
+            </div>
             <p className="mt-3 flex items-center gap-2 text-[0.8rem] text-[var(--muted-ink)]">
               <ShieldCheck className="size-4 text-[var(--safe)]" /> Video and controls travel directly between your devices.
             </p>
@@ -399,6 +479,30 @@ export function RemoteController() {
           </div>
         </div>
       </section>
+
+      <Drawer open={scannerOpen} onOpenChange={setScannerOpen} showSwipeHandle>
+        <DrawerContent className="scanner-drawer">
+          <DrawerHeader className="scanner-header text-left">
+            <div>
+              <DrawerTitle>Scan the computer QR code</DrawerTitle>
+              <DrawerDescription>The code stays on your Windows companion while it waits for your phone.</DrawerDescription>
+            </div>
+            <button type="button" className="scanner-close" onClick={() => setScannerOpen(false)} aria-label="Close camera scanner">
+              <X />
+            </button>
+          </DrawerHeader>
+          <div className="scanner-content">
+            <div className="scanner-viewfinder">
+              <video ref={scannerVideoRef} muted playsInline aria-label="Camera preview for QR scanning" />
+              <span className="scanner-target" aria-hidden="true"><ScanLine /></span>
+            </div>
+            <output className="scanner-status" aria-live="polite">{scannerStatus}</output>
+            <Button variant="outline" className="scanner-manual" onClick={() => setScannerOpen(false)}>
+              Enter code manually
+            </Button>
+          </div>
+        </DrawerContent>
+      </Drawer>
 
       <footer className="relative z-10 mx-auto flex w-full max-w-6xl items-center justify-between px-5 pb-6 text-[0.72rem] text-[var(--muted-ink)] sm:px-8">
         <span>No account. No stored video.</span><span className="hidden sm:block">Peer-to-peer WebRTC</span>

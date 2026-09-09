@@ -10,7 +10,7 @@ Requirements: Windows 10/11 and Node.js 22 or newer.
 
 1. In PowerShell, run `./Start-CompCtrl.ps1` from this folder.
 2. On the companion window, copy the eight-character pairing code.
-3. Open the [published phone controller](https://nomsams.github.io/compctrl/) or scan the QR code in the companion, then enter the code.
+3. Open the [published phone controller](https://nomsams.github.io/compctrl/), tap **Scan QR code**, and point the phone camera at the QR shown by the companion. You can still enter the eight-character code manually.
 
 For development, use two terminals:
 
@@ -36,6 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 ## Controls
 
 - Touch the point on the live screen where the Windows pointer should go. Tap to click and drag to drag.
+- **Scan QR code** opens the phone's rear camera and connects from the QR code displayed in the Windows companion.
 - Drag with two fingers to scroll.
 - Use the always-visible **Ctrl+C** and **Ctrl+V** buttons for clipboard shortcuts.
 - **Keys** opens a phone typing field plus every standard PC key, function keys, modifiers, navigation keys, and arrows.

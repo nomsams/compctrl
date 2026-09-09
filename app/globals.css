@@ -96,6 +96,22 @@ button, input { font: inherit; }
 .status-dot { width: .46rem; height: .46rem; border-radius: 999px; background: #19c98e; box-shadow: 0 0 0 4px rgba(25,201,142,.12); }
 .pairing-field { display: flex; align-items: center; border: 1px solid #ccd2da; border-radius: 1rem; background: rgba(255,255,255,.82); box-shadow: 0 14px 40px rgba(40,48,66,.08), inset 0 1px white; transition: border-color .2s, box-shadow .2s; }
 .pairing-field:focus-within { border-color: rgba(49,94,251,.65); box-shadow: 0 0 0 4px rgba(49,94,251,.09), 0 14px 40px rgba(40,48,66,.08); }
+.pairing-secondary { display: flex; align-items: center; gap: .8rem; margin-top: .75rem; }
+.pairing-secondary > span { color: var(--muted-ink); font-size: .76rem; }
+.scan-code-button { min-height: 2.75rem; border-color: rgba(49,94,251,.2); border-radius: .85rem; background: rgba(255,255,255,.72); color: var(--accent); font-weight: 650; }
+.scanner-drawer { border-color: rgba(255,255,255,.12); background: #10141e; color: white; }
+.scanner-header { display: flex; flex-direction: row; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 1rem 1.1rem .85rem; }
+.scanner-header [data-slot="drawer-title"] { color: white; font-size: 1.05rem; }
+.scanner-header [data-slot="drawer-description"] { max-width: 32rem; margin-top: .2rem; color: rgba(255,255,255,.58); }
+.scanner-close { display: grid; width: 2.5rem; height: 2.5rem; flex: 0 0 auto; place-items: center; border: 1px solid rgba(255,255,255,.12); border-radius: .75rem; background: rgba(255,255,255,.07); color: white; }
+.scanner-close svg { width: 1.1rem; }
+.scanner-content { width: min(100%, 31rem); margin: 0 auto; padding: 0 1rem calc(1rem + env(safe-area-inset-bottom)); }
+.scanner-viewfinder { position: relative; overflow: hidden; aspect-ratio: 4 / 3; border: 1px solid rgba(255,255,255,.14); border-radius: 1.15rem; background: #05070b; box-shadow: 0 18px 60px rgba(0,0,0,.35); }
+.scanner-viewfinder video { width: 100%; height: 100%; object-fit: cover; }
+.scanner-target { pointer-events: none; position: absolute; inset: 16%; display: grid; place-items: center; border: 2px solid rgba(255,255,255,.82); border-radius: 1rem; box-shadow: 0 0 0 999px rgba(5,7,11,.28); }
+.scanner-target svg { width: 2rem; height: 2rem; color: white; filter: drop-shadow(0 2px 5px rgba(0,0,0,.45)); }
+.scanner-status { min-height: 2.6rem; margin: .8rem .25rem .3rem; color: rgba(255,255,255,.72); font-size: .83rem; line-height: 1.5; text-align: center; }
+.scanner-manual { width: 100%; min-height: 2.8rem; border-color: rgba(255,255,255,.18); background: rgba(255,255,255,.06); color: white; }
 .device-stage { position: relative; min-height: 420px; display: grid; align-items: center; perspective: 1000px; }
 .screen-card { overflow: hidden; border: 1px solid rgba(255,255,255,.12); border-radius: 1.45rem; background: #151a25; box-shadow: 0 35px 90px rgba(25,32,46,.26), 0 0 0 7px rgba(255,255,255,.45); transform: rotateY(-5deg) rotateX(2deg); }
 .screen-topbar { height: 2.6rem; display: flex; align-items: center; justify-content: space-between; padding: 0 1rem; border-bottom: 1px solid rgba(255,255,255,.08); }
@@ -204,6 +220,7 @@ button, input { font: inherit; }
 .pair-code-display button svg { width: .92rem; color: #8a929e; }
 .qr-panel { display: flex; min-height: 246px; flex-direction: column; align-items: center; justify-content: center; gap: .8rem; border: 1px solid #e0e4e9; border-radius: 1rem; background: #f7f8fa; padding: 1rem; }
 .qr-panel > svg { width: 180px; height: 180px; border-radius: .55rem; }
+.qr-title { color: #1b2029; font-size: .78rem; font-weight: 750; }
 .qr-panel small { color: #7d8591; font-size: .66rem; }
 .qr-placeholder { display: flex; width: 180px; height: 180px; flex-direction: column; align-items: center; justify-content: center; gap: .7rem; border: 1px dashed #cdd3db; border-radius: .7rem; color: #89919d; text-align: center; }
 .qr-placeholder svg { width: 1.4rem; }
@@ -251,6 +268,9 @@ button, input { font: inherit; }
   .mock-sidebar { padding: .8rem .55rem; }
   .mock-sidebar span { width: 2rem; height: 2rem; }
   .floating-chip { display: none; }
+  .pairing-secondary { align-items: stretch; flex-direction: column; gap: .45rem; }
+  .pairing-secondary > span { text-align: center; }
+  .scan-code-button { width: 100%; }
   .phone-bar { bottom: -.5rem; width: 94%; }
 }
 @media (orientation: landscape) and (max-height: 500px) {

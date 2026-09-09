@@ -62,6 +62,18 @@ export function cleanCode(value: string) {
     .slice(0, CODE_LENGTH);
 }
 
+export function pairingCodeFromQr(payload: string) {
+  const trimmed = payload.trim();
+  try {
+    const url = new URL(trimmed);
+    const fromHash = url.hash.slice(1).toUpperCase().replace(/[^A-Z2-9]/g, '');
+    return fromHash.length === CODE_LENGTH ? fromHash : '';
+  } catch {
+    const direct = trimmed.toUpperCase().replace(/[\s-]/g, '');
+    return /^[A-Z2-9]{8}$/.test(direct) ? direct : '';
+  }
+}
+
 export function createPairingCode() {
   const bytes = new Uint8Array(CODE_LENGTH);
   crypto.getRandomValues(bytes);
