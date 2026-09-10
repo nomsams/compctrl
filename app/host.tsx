@@ -102,7 +102,7 @@ export function HostController() {
     if (message.type === 'display') {
       const blanked = await api.setDisplayBlanked(message.blanked);
       setScreenBlanked(blanked);
-      setNotice(blanked ? 'Local screens are private' : 'Local screens restored');
+      setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
       send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
       return;
     }
@@ -139,7 +139,7 @@ export function HostController() {
     if (!api) return;
     return api.onDisplayState((blanked) => {
       setScreenBlanked(blanked);
-      setNotice(blanked ? 'Local screens are private' : 'Local screens restored');
+      setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
       send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
     });
   }, [api, send]);
@@ -372,7 +372,7 @@ export function HostController() {
             </div>
             <div className="host-setting-row">
               <span className="host-setting-icon"><EyeOff /></span>
-              <span><strong>Privacy screen</strong><small>Remote stays active · Recovery: Ctrl+Alt+Shift+F12</small></span>
+              <span><strong>Power displays off</strong><small>Hardware power-off · Recovery: Ctrl+Alt+Shift+F12</small></span>
               <Switch
                 checked={screenBlanked}
                 onCheckedChange={(blanked) => {

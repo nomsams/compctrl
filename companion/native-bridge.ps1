@@ -52,6 +52,7 @@ public static class CompCtrlNative
     [DllImport("user32.dll")] private static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern short VkKeyScan(char character);
     [DllImport("user32.dll")] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
 
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
@@ -142,6 +143,14 @@ public static class CompCtrlNative
         SetCursorPos(nextX, point.Y);
         SetCursorPos(point.X, point.Y);
     }
+
+    public static void DisplayPower(bool off)
+    {
+        // HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER. State 2 powers the
+        // physical displays off; -1 powers them back on.
+        PostMessage(new IntPtr(0xFFFF), 0x0112u, new IntPtr(0xF170), new IntPtr(off ? 2 : -1));
+        if (!off) Jiggle();
+    }
 }
 '@
 
@@ -186,6 +195,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             'key' { Invoke-KeyMessage $message }
             'text' { [CompCtrlNative]::Text([string]$message.text) }
             'jiggle' { [CompCtrlNative]::Jiggle() }
+            'display-power' { [CompCtrlNative]::DisplayPower(([string]$message.state) -eq 'off') }
         }
     }
     catch {

@@ -669,6 +669,8 @@ function RemoteSurface({
   const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
   const keyboardInputRef = useRef<HTMLInputElement>(null);
   const quickKeyboardInputRef = useRef<HTMLInputElement>(null);
+  const inputHistoryRef = useRef(new WeakMap<HTMLInputElement, string>());
+  const composingInputsRef = useRef(new WeakSet<HTMLInputElement>());
   const nativeFullscreenRef = useRef(false);
   const pointerState = useRef({
     points: new Map<number, {
@@ -858,6 +860,26 @@ function RemoteSurface({
       window.removeEventListener('orientationchange', endActiveGesture);
     };
   }, [endActiveGesture, measureStage]);
+
+  useEffect(() => {
+    const shell = stageRef.current?.closest<HTMLElement>('.remote-shell');
+    const viewport = window.visualViewport;
+    if (!shell) return;
+    const syncViewport = () => {
+      shell.style.setProperty('--controller-visual-height', `${viewport?.height ?? window.innerHeight}px`);
+      shell.style.setProperty('--controller-visual-top', `${viewport?.offsetTop ?? 0}px`);
+      window.requestAnimationFrame(measureStage);
+    };
+    syncViewport();
+    viewport?.addEventListener('resize', syncViewport);
+    viewport?.addEventListener('scroll', syncViewport);
+    return () => {
+      viewport?.removeEventListener('resize', syncViewport);
+      viewport?.removeEventListener('scroll', syncViewport);
+      shell.style.removeProperty('--controller-visual-height');
+      shell.style.removeProperty('--controller-visual-top');
+    };
+  }, [measureStage]);
 
   useEffect(() => () => endActiveGesture(), [endActiveGesture]);
 
@@ -1118,18 +1140,55 @@ function RemoteSurface({
     setActiveModifiers([]);
   };
 
+  const relayInputValue = (input: HTMLInputElement) => {
+    const previous = inputHistoryRef.current.get(input) ?? '';
+    const next = input.value;
+    if (previous === next) return;
+    let prefix = 0;
+    while (prefix < previous.length && prefix < next.length && previous[prefix] === next[prefix]) prefix += 1;
+    // The Windows caret is kept at the end of this relay buffer. Rebuild the
+    // changed tail so mobile autocorrect, swipe typing, and mid-word edits stay
+    // in sync instead of inserting replacement text in the wrong position.
+    const removed = previous.length - prefix;
+    const inserted = next.slice(prefix);
+    for (let index = 0; index < removed; index += 1) {
+      send({ type: 'key', action: 'tap', key: 'Backspace' });
+    }
+    if (inserted) send({ type: 'text', text: inserted });
+    inputHistoryRef.current.set(input, next);
+  };
+
   const relayKeyboardInput = (event: ReactSyntheticEvent<HTMLInputElement>) => {
-    const input = event.currentTarget;
-    if (input.value) send({ type: 'text', text: input.value });
-    input.value = '';
+    if (!composingInputsRef.current.has(event.currentTarget)) relayInputValue(event.currentTarget);
   };
 
   const relayKeyboardKey = (event: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (event.key === 'Backspace' || event.key === 'Enter' || event.key === 'Tab' || event.key === 'Escape') {
+    if (event.key === 'Backspace') {
+      if (event.currentTarget.value.length === 0) {
+        event.preventDefault();
+        send({ type: 'key', action: 'tap', key: 'Backspace', modifiers: activeModifiers });
+        setActiveModifiers([]);
+      }
+      return;
+    }
+    if (event.key === 'Enter' || event.key === 'Tab' || event.key === 'Escape') {
       event.preventDefault();
       send({ type: 'key', action: 'tap', key: event.key, modifiers: activeModifiers });
       setActiveModifiers([]);
+      if (event.key === 'Enter') {
+        event.currentTarget.value = '';
+        inputHistoryRef.current.set(event.currentTarget, '');
+      }
     }
+  };
+
+  const beginKeyboardComposition = (event: ReactSyntheticEvent<HTMLInputElement>) => {
+    composingInputsRef.current.add(event.currentTarget);
+  };
+
+  const finishKeyboardComposition = (event: ReactSyntheticEvent<HTMLInputElement>) => {
+    composingInputsRef.current.delete(event.currentTarget);
+    relayInputValue(event.currentTarget);
   };
 
   const openPhoneKeyboard = () => {
@@ -1138,8 +1197,13 @@ function RemoteSurface({
       window.setTimeout(() => keyboardInputRef.current?.focus(), 350);
       return;
     }
+    const input = quickKeyboardInputRef.current;
+    if (input && !nativeKeyboardActive) {
+      input.value = '';
+      inputHistoryRef.current.set(input, '');
+    }
     setNativeKeyboardActive(true);
-    quickKeyboardInputRef.current?.focus({ preventScroll: true });
+    input?.focus({ preventScroll: true });
   };
 
   const setPictureInPicture = async (enabled: boolean) => {
@@ -1183,7 +1247,7 @@ function RemoteSurface({
       <header className="remote-topbar">
         <div className="min-w-0">
           <div className="flex items-center gap-2"><span className={`remote-state-dot ${connected ? 'is-live' : ''}`} /><strong className="truncate">{computerName}</strong></div>
-          <p>{statusText}{screenBlanked ? ' · Local screens off' : ''} · {code.slice(0, 4)} {code.slice(4)}</p>
+          <p>{statusText}{screenBlanked ? ' · Displays powered off' : ''} · {code.slice(0, 4)} {code.slice(4)}</p>
         </div>
         <div className="remote-topbar-actions">
           <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => void setImmersiveMode(true)} aria-label="Enter fullscreen controller">
@@ -1266,10 +1330,20 @@ function RemoteSurface({
         )}
         {screenBlanked && (
           <button type="button" className="screen-blank-chip" onClick={() => setScreenBlanked(false)}>
-            <EyeOff /> Local screens off <small>Turn on</small>
+            <EyeOff /> Displays off <small>Turn on</small>
           </button>
         )}
-        <div className="scroll-buttons" aria-label="Scroll controls">
+        <div className={`scroll-buttons ${immersive ? 'has-clicks' : ''}`} aria-label="Pointer and scroll controls">
+          {immersive && (
+            <>
+              <button type="button" className="is-primary" onClick={() => sendPointer('click')} disabled={!connected} aria-label="Left click">
+                <MousePointerClick /><span>Left</span>
+              </button>
+              <button type="button" onClick={() => sendPointer('click', 'right')} disabled={!connected} aria-label="Right click">
+                <MousePointer2 /><span>Right</span>
+              </button>
+            </>
+          )}
           <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: -360 })} disabled={!connected} aria-label="Scroll up">
             <ChevronUp /><span>Up</span>
           </button>
@@ -1326,10 +1400,14 @@ function RemoteSurface({
           placeholder="Type directly to Windows…"
           autoCapitalize="sentences"
           autoCorrect="on"
+          spellCheck
+          enterKeyHint="enter"
           tabIndex={nativeKeyboardActive ? 0 : -1}
           onFocus={() => setNativeKeyboardActive(true)}
           onInput={relayKeyboardInput}
           onKeyDown={relayKeyboardKey}
+          onCompositionStart={beginKeyboardComposition}
+          onCompositionEnd={finishKeyboardComposition}
           onBlur={() => setNativeKeyboardActive(false)}
         />
         <button
@@ -1373,8 +1451,12 @@ function RemoteSurface({
               placeholder="Tap here, then type…"
               autoCapitalize="sentences"
               autoCorrect="on"
+              spellCheck
+              enterKeyHint="enter"
               onInput={relayKeyboardInput}
               onKeyDown={relayKeyboardKey}
+              onCompositionStart={beginKeyboardComposition}
+              onCompositionEnd={finishKeyboardComposition}
             />
             <fieldset className="pc-keyboard" aria-label="Full PC keyboard">
               {keyRows.map((row, rowIndex) => (
@@ -1499,8 +1581,8 @@ function RemoteSurface({
             <div className="control-row">
               <span className="control-row-icon"><EyeOff /></span>
               <span>
-                <strong>Turn local screens off</strong>
-                <small>{displayControlSupported ? 'Desktop remains visible here · Recovery: Ctrl+Alt+Shift+F12' : 'Install the latest Windows companion to enable'}</small>
+                <strong>Power local displays off</strong>
+                <small>{displayControlSupported ? 'Hardware power-off · kept off after remote input' : 'Install the latest Windows companion to enable'}</small>
               </span>
               <Switch
                 checked={screenBlanked}
