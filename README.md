@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.2.0-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.2.1-x64.exe
 ```
 
 ## Controls
@@ -59,6 +59,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
 - A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active code across a page reload. Disconnecting manually disables auto-reconnect.
 - Screen capture has its own recovery path: the phone reports the companion's capture status, retries stalled video automatically, and provides a **Retry screen** button without disconnecting mouse or keyboard control.
+- If a browser or display driver leaves a live stream black or frozen, use **Session controls → Restart screen stream** to force a fresh desktop capture without re-pairing.
 
 ## Security and network notes
 

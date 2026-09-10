@@ -264,8 +264,16 @@ export function HostController() {
         });
         const call = peer.call(remoteId, stream, { metadata: { protocol: PROTOCOL_VERSION } });
         callRef.current = call;
-        call.on('close', stopStream);
-        call.on('error', stopStream);
+        const finishCall = () => {
+          if (callRef.current !== call) return;
+          callRef.current = null;
+          if (streamRef.current === stream) {
+            streamRef.current = null;
+            stream.getTracks().forEach((track) => track.stop());
+          }
+        };
+        call.on('close', finishCall);
+        call.on('error', finishCall);
       } catch (error) {
         const detail = error instanceof Error ? error.message : 'unknown error';
         setNotice(`Could not start screen sharing: ${detail}`);
@@ -337,7 +345,8 @@ export function HostController() {
               screenBlanked: screenBlankedRef.current,
               dictationAvailable: groqKeyConfiguredRef.current,
             } satisfies HostMessage);
-            void shareScreenWith(incoming.peer);
+            // The authenticated controller requests capture after processing these
+            // ordered messages, so a media call cannot race ahead of auth-ok.
           }).catch(() => incoming.close());
           return;
         }

@@ -488,6 +488,7 @@ export function RemoteController() {
             setDisplayControlSupported(supported);
             setScreenBlanked(supported && message.screenBlanked);
             setHostNotice('Connected. Starting desktop video…');
+            if (!callRef.current) send({ type: 'stream', action: 'request' });
           } else if (message.type === 'status') {
             setJigglerEnabled(message.jigglerEnabled);
             setDictationAvailable(message.dictationAvailable);
@@ -527,14 +528,23 @@ export function RemoteController() {
         mediaRetryTimer = null;
         setHostNotice('Receiving desktop video…');
         const streamTimeout = window.setTimeout(() => {
-          if (callRef.current !== incomingCall || streamRef.current) return;
+          if (callRef.current !== incomingCall) return;
           setHostNotice('Desktop video timed out. Retrying…');
           incomingCall.close();
         }, 12_000);
+        let remoteVideoTrack: MediaStreamTrack | null = null;
+        const markMediaLive = () => {
+          if (callRef.current !== incomingCall) return;
+          window.clearTimeout(streamTimeout);
+          setHostNotice('');
+        };
         const recoverMedia = () => {
           window.clearTimeout(streamTimeout);
+          remoteVideoTrack?.removeEventListener('unmute', markMediaLive);
+          remoteVideoTrack?.removeEventListener('ended', recoverMedia);
           if (callRef.current !== incomingCall) return;
           callRef.current = null;
+          streamRef.current?.getTracks().forEach((track) => track.stop());
           streamRef.current = null;
           setStream(null);
           if (!disposed && connectionRef.current?.open) {
@@ -545,14 +555,25 @@ export function RemoteController() {
         };
         incomingCall.answer();
         incomingCall.on('stream', (remoteStream) => {
-          window.clearTimeout(streamTimeout);
           if (callRef.current !== incomingCall) {
             remoteStream.getTracks().forEach((track) => track.stop());
             return;
           }
+          remoteVideoTrack = remoteStream.getVideoTracks()[0] ?? null;
+          if (!remoteVideoTrack || remoteVideoTrack.readyState !== 'live') {
+            setHostNotice('The desktop stream contained no live video. Retrying…');
+            incomingCall.close();
+            return;
+          }
           streamRef.current = remoteStream;
           setStream(remoteStream);
-          setHostNotice('');
+          remoteVideoTrack.addEventListener('ended', recoverMedia, { once: true });
+          if (remoteVideoTrack.muted) {
+            setHostNotice('Connected. Waiting for the first desktop frame…');
+            remoteVideoTrack.addEventListener('unmute', markMediaLive, { once: true });
+          } else {
+            markMediaLive();
+          }
         });
         incomingCall.on('close', recoverMedia);
         incomingCall.on('error', recoverMedia);
@@ -886,6 +907,7 @@ function RemoteSurface({
   const [nativeKeyboardActive, setNativeKeyboardActive] = useState(false);
   const [pipSupported, setPipSupported] = useState(false);
   const [pipActive, setPipActive] = useState(false);
+  const [videoReady, setVideoReady] = useState(false);
   const [pointerMode, setPointerMode] = useState<'touchpad' | 'direct'>(() => {
     if (typeof window === 'undefined') return 'touchpad';
     return window.localStorage.getItem('compctrl.pointerMode') === 'direct' ? 'direct' : 'touchpad';
@@ -991,11 +1013,25 @@ function RemoteSurface({
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
+    setVideoReady(false);
     video.srcObject = stream;
-    if (stream) void video.play().catch(() => undefined);
+    const markVideoReady = () => {
+      setVideoReady(true);
+      measureStage();
+    };
+    if (stream) {
+      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) markVideoReady();
+      void video.play().catch(() => setVideoReady(false));
+    }
     measureStage();
     video.addEventListener('resize', measureStage);
-    return () => video.removeEventListener('resize', measureStage);
+    video.addEventListener('loadeddata', markVideoReady);
+    video.addEventListener('playing', markVideoReady);
+    return () => {
+      video.removeEventListener('resize', measureStage);
+      video.removeEventListener('loadeddata', markVideoReady);
+      video.removeEventListener('playing', markVideoReady);
+    };
   }, [measureStage, stream]);
 
   useEffect(() => {
@@ -1491,9 +1527,9 @@ function RemoteSurface({
           </span>
         )}
         </button>
-        {connected && !stream && (
+        {connected && (!stream || !videoReady) && (
           <button type="button" className="stream-retry-button" onClick={() => send({ type: 'stream', action: 'request' })}>
-            <RefreshCw /> Retry screen
+            <RefreshCw /> {stream ? 'Restart screen' : 'Retry screen'}
           </button>
         )}
         {stream && view.scale > 1.01 && (
@@ -1773,6 +1809,19 @@ function RemoteSurface({
               <ShieldCheck className={dictationAvailable ? 'text-emerald-400' : 'opacity-30'} />
             </div>
             <div className="control-section-label">Session</div>
+            {connected && (
+              <button
+                type="button"
+                className="control-row"
+                onClick={() => {
+                  setVideoReady(false);
+                  setControlsOpen(false);
+                  send({ type: 'stream', action: 'request' });
+                }}
+              >
+                <span className="control-row-icon"><RefreshCw /></span><span><strong>Restart screen stream</strong><small>Recapture the desktop if video is black or frozen</small></span><ArrowRight />
+              </button>
+            )}
             {!connected && (
               <button type="button" className="control-row" onClick={reconnect}>
                 <span className="control-row-icon"><RefreshCw /></span><span><strong>Retry connection</strong><small>Start a fresh rendezvous now</small></span><ArrowRight />
