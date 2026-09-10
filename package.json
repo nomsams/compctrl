@@ -15,7 +15,7 @@
     "build:pages": "vite build",
     "verify:desktop-bundle": "node scripts/verify-desktop-bundle.mjs",
     "companion": "electron companion/main.cjs",
-    "pack:windows": "npm run build:desktop && npm run verify:desktop-bundle && node scripts/create-integrity-manifest.mjs && electron-builder --win nsis portable && node scripts/create-checksums.mjs",
+    "pack:windows": "npm run build:desktop && npm run verify:desktop-bundle && node scripts/create-integrity-manifest.mjs && electron-builder --win nsis portable --publish never && node scripts/create-checksums.mjs",
     "start": "wrangler dev --config dist/server/wrangler.json",
     "test:geometry": "node --experimental-strip-types --test lib/*.test.ts",
     "lint": "oxlint app lib",
