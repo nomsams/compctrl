@@ -11,9 +11,11 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:desktop": "vite build --base=/",
     "build:pages": "vite build",
+    "verify:desktop-bundle": "node scripts/verify-desktop-bundle.mjs",
     "companion": "electron companion/main.cjs",
-    "pack:windows": "npm run build && electron-builder --win nsis portable",
+    "pack:windows": "npm run build:desktop && npm run verify:desktop-bundle && electron-builder --win nsis portable",
     "start": "wrangler dev --config dist/server/wrangler.json",
     "test:geometry": "node --experimental-strip-types --test lib/remote-geometry.test.ts",
     "lint": "oxlint app lib",
