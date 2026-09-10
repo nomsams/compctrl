@@ -9,8 +9,8 @@ After the initial rendezvous, video and control messages use an encrypted WebRTC
 Requirements: Windows 10/11 and Node.js 22 or newer.
 
 1. In PowerShell, run `./Start-CompCtrl.ps1` from this folder.
-2. On the companion window, copy the eight-character pairing code.
-3. Open the [published phone controller](https://nomsams.github.io/compctrl/), tap **Scan QR code**, and point the phone camera at the QR shown by the companion. You can still enter the eight-character code manually.
+2. On the companion window, copy the twelve-character pairing code.
+3. Open the [published phone controller](https://nomsams.github.io/compctrl/), tap **Scan QR code**, and point the phone camera at the QR shown by the companion. You can still enter the twelve-character code manually.
 
 For development, use two terminals:
 
@@ -31,7 +31,13 @@ Closing the companion window sends it to the Windows notification tray. “Start
 3. The included `Deploy phone controller to GitHub Pages` workflow publishes `dist/client` and reports the HTTPS address.
 4. Paste that address into the Windows companion to enable one-scan QR pairing.
 
-The `Build Windows companion` workflow can be run manually from the Actions page. It produces installer and portable `.exe` artifacts. Locally, `npm run pack:windows` creates the same files in `release/`.
+The `Build Windows companion` workflow can be run manually from the Actions page. It produces installer and portable `.exe` artifacts together with `SHA256SUMS.txt`, individual `.sha256` files, and `Verify-CompCtrl.ps1`. Locally, `npm run pack:windows` creates the same files in `release/`.
+
+To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
+
+```powershell
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.2.0-x64.exe
+```
 
 ## Controls
 
@@ -46,6 +52,8 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 - Use the always-visible **Ctrl+C** and **Ctrl+V** buttons for clipboard shortcuts.
 - **Type** opens the phone's native keyboard in a compact typing strip by default. Enable **Show full PC key panel** when you want the keyboard button to open function keys, modifiers, navigation keys, and arrows instead.
 - Use the dedicated **Up** and **Down** buttons on the edge of the desktop for reliable one-tap scrolling, or keep using the two-finger scroll gesture.
+- Fullscreen adds a dedicated **Enter** key beside left click, right click, and the two scroll buttons.
+- For voice dictation, create a key in the [Groq console](https://console.groq.com/keys), save it in the Windows companion, focus the desired text field on the remote computer, then tap **Voice** on the phone. Tap again to stop; the companion transcribes with `whisper-large-v3-turbo` and inserts the result at the focused Windows caret.
 - **Floating mini video** uses the phone browser's Picture-in-Picture mode when available, so the live computer view can stay above other apps. Return to the controller at any time; it resumes the existing session or reconnects automatically after mobile background suspension.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
 - **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
@@ -55,10 +63,14 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 ## Security and network notes
 
 - The Windows companion is required. Normal web pages are deliberately prevented from controlling the operating system or capturing the desktop unattended.
-- Pairing codes use an unambiguous 32-character alphabet and provide about 40 bits of entropy. Generate a new code from the companion whenever a code may have been shared.
+- Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls.
+- The companion validates message shapes and sizes, rate-limits authenticated controllers, limits audio uploads and Groq calls, rejects navigation/downloads in its renderer, and accepts native IPC only from its private loopback page.
 - WebRTC encrypts media and data in transit. The default public PeerJS signaling service can see connection metadata such as the temporary peer ID and IP addresses, but not decrypted screen or input data.
 - This build intentionally has no default TURN relay so the screen does not fall back to a third-party media server. A direct P2P route may fail on restrictive corporate, hotel, or carrier networks.
 - The native bridge accepts commands only through Electron IPC; it does not open a local TCP port. Restart and shutdown are unavailable until a paired WebRTC data channel is open, and the phone UI requires a press-and-hold confirmation.
+- The Groq key is encrypted with Electron `safeStorage` (Windows DPAPI) and is never returned to the phone or page. Dictation audio does leave the P2P session: the companion sends it over HTTPS to Groq for transcription. No Groq key is included in this repository or any build.
+- Packaged companions verify the native bridge and bundled web assets against a SHA-256 manifest embedded inside the application before starting. Release checksums detect a damaged or substituted download, but they are not a substitute for code signing and cannot defend against an attacker who controls both the release account and its published hashes.
+- No remote-control application can remain trustworthy after an attacker gains administrator-level control of the Windows account or modifies the running operating system. The controls above are intended to prevent guessing, replay, malformed-message abuse, and accidental package corruption—not to claim protection from a fully compromised endpoint.
 - Display-off state is deliberately not saved across a companion restart. Windows normally wakes powered-off displays on injected input, so CompCtrl sends the native off command again while this mode remains enabled. Some display drivers may pause desktop capture while their panel is powered down.
 
 ## Project layout

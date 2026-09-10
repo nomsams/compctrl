@@ -26,6 +26,7 @@ declare global {
         jigglerEnabled: boolean;
         screenBlanked: boolean;
         autoStart: boolean;
+        groqKeyConfigured: boolean;
         version: string;
       }>;
       saveSettings(settings: {
@@ -33,6 +34,8 @@ declare global {
         controllerUrl?: string;
         autoStart?: boolean;
       }): Promise<void>;
+      setGroqApiKey(key: string): Promise<boolean>;
+      transcribeAudio(chunks: string[], mimeType: string): Promise<string>;
       dispatch(message: import('@/lib/protocol').ControllerMessage): Promise<void>;
       setJiggler(enabled: boolean): Promise<void>;
       setDisplayBlanked(enabled: boolean): Promise<boolean>;

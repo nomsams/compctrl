@@ -4,22 +4,30 @@ const {
   Menu,
   Tray,
   desktopCapturer,
+  dialog,
   globalShortcut,
   ipcMain,
   nativeImage,
   powerSaveBlocker,
+  safeStorage,
   session,
   shell,
 } = require('electron');
 const { spawn } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const CODE_LENGTH = 12;
 const JIGGLE_INTERVAL_MS = 30_000;
 const DISPLAY_OFF_REASSERT_MS = 2_000;
+const GROQ_TRANSCRIPTION_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
+const GROQ_WHISPER_MODEL = 'whisper-large-v3-turbo';
+const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
+const MAX_NATIVE_QUEUE = 512;
 const DEFAULT_CONTROLLER_URL = 'https://nomsams.github.io/compctrl/';
 const isDevelopment = !app.isPackaged;
 
@@ -35,10 +43,11 @@ let displayOffTimer = null;
 let displayOffAfterInputTimer = null;
 let screenBlanked = false;
 let isQuitting = false;
+let transcriptionInProgress = false;
+let transcriptionTimes = [];
 
 function generateCode() {
-  const crypto = require('node:crypto');
-  return Array.from(crypto.randomBytes(8), (byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
+  return Array.from(crypto.randomBytes(CODE_LENGTH), (byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
 }
 
 function settingsPath() {
@@ -51,6 +60,7 @@ function defaultSettings() {
     controllerUrl: process.env.COMPCTRL_WEB_URL || DEFAULT_CONTROLLER_URL,
     jigglerEnabled: false,
     autoStart: true,
+    groqApiKeyProtected: '',
   };
 }
 
@@ -59,9 +69,15 @@ function readSettings() {
     const defaults = defaultSettings();
     const stored = JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
     return {
-      ...defaults,
-      ...stored,
-      controllerUrl: stored.controllerUrl || defaults.controllerUrl,
+      pairingCode: typeof stored.pairingCode === 'string' && new RegExp(`^[A-Z2-9]{${CODE_LENGTH}}$`).test(stored.pairingCode)
+        ? stored.pairingCode
+        : defaults.pairingCode,
+      controllerUrl: typeof stored.controllerUrl === 'string' && stored.controllerUrl.length < 2_048
+        ? stored.controllerUrl
+        : defaults.controllerUrl,
+      jigglerEnabled: stored.jigglerEnabled === true,
+      autoStart: stored.autoStart !== false,
+      groqApiKeyProtected: typeof stored.groqApiKeyProtected === 'string' ? stored.groqApiKeyProtected : '',
     };
   } catch {
     return defaultSettings();
@@ -73,13 +89,104 @@ function writeSettings(settings) {
   const temporaryPath = `${settingsPath()}.tmp`;
   fs.writeFileSync(temporaryPath, JSON.stringify(settings, null, 2), { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(temporaryPath, settingsPath());
+  try { fs.chmodSync(settingsPath(), 0o600); } catch { /* Windows protects this through the user profile ACL. */ }
 }
 
 let settings = null;
 
+function hasGroqApiKey() {
+  return Boolean(settings?.groqApiKeyProtected && safeStorage.isEncryptionAvailable());
+}
+
+function setGroqApiKey(value) {
+  const key = typeof value === 'string' ? value.trim() : '';
+  if (!key) {
+    settings.groqApiKeyProtected = '';
+    writeSettings(settings);
+    return false;
+  }
+  if (key.length < 20 || key.length > 256 || /\s/.test(key)) throw new Error('Enter a valid Groq API key.');
+  if (!safeStorage.isEncryptionAvailable()) throw new Error('Windows credential encryption is unavailable for this account.');
+  settings.groqApiKeyProtected = safeStorage.encryptString(key).toString('base64');
+  writeSettings(settings);
+  return true;
+}
+
+function readGroqApiKey() {
+  if (!hasGroqApiKey()) throw new Error('Add a Groq API key in the Windows companion first.');
+  try {
+    return safeStorage.decryptString(Buffer.from(settings.groqApiKeyProtected, 'base64'));
+  } catch {
+    throw new Error('The saved Groq API key could not be unlocked by this Windows account. Save it again.');
+  }
+}
+
+function isNativeMessage(message) {
+  if (!message || typeof message !== 'object') return false;
+  if (message.type === 'pointer') {
+    return ['move', 'down', 'up', 'click'].includes(message.action)
+      && Number.isFinite(message.x) && message.x >= 0 && message.x <= 1
+      && Number.isFinite(message.y) && message.y >= 0 && message.y <= 1
+      && (message.button === undefined || ['left', 'right', 'middle'].includes(message.button));
+  }
+  if (message.type === 'wheel') {
+    return Number.isFinite(message.deltaX) && Math.abs(message.deltaX) <= 2_000
+      && Number.isFinite(message.deltaY) && Math.abs(message.deltaY) <= 2_000;
+  }
+  if (message.type === 'key') {
+    return ['down', 'up', 'tap'].includes(message.action)
+      && typeof message.key === 'string' && message.key.length >= 1 && message.key.length <= 32
+      && (message.modifiers === undefined || (
+        Array.isArray(message.modifiers) && message.modifiers.length <= 4
+        && message.modifiers.every((modifier) => ['Control', 'Alt', 'Shift', 'Meta'].includes(modifier))
+      ));
+  }
+  return message.type === 'text' && typeof message.text === 'string' && message.text.length > 0 && message.text.length <= 16_384;
+}
+
+function assertTrustedIpc(event) {
+  if (
+    !mainWindow
+    || mainWindow.isDestroyed()
+    || event.sender !== mainWindow.webContents
+    || !isTrustedRendererUrl(event.senderFrame?.url || event.sender?.getURL?.() || '')
+  ) {
+    throw new Error('Blocked IPC request from an untrusted renderer.');
+  }
+}
+
+function sha256File(filePath) {
+  return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function verifyBundledIntegrity() {
+  if (!app.isPackaged) return { ok: true };
+  try {
+    const manifestPath = path.join(app.getAppPath(), 'companion', 'integrity.json');
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (manifest.version !== 1 || manifest.algorithm !== 'sha256' || !Array.isArray(manifest.files)) {
+      throw new Error('invalid integrity manifest');
+    }
+    const resourcesRoot = path.resolve(process.resourcesPath);
+    for (const entry of manifest.files) {
+      if (!entry || typeof entry.path !== 'string' || !/^[A-Za-z0-9._/-]+$/.test(entry.path) || !/^[a-f0-9]{64}$/.test(entry.sha256)) {
+        throw new Error('invalid integrity entry');
+      }
+      const target = path.resolve(resourcesRoot, ...entry.path.split('/'));
+      const relative = path.relative(resourcesRoot, target);
+      if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw new Error('unsafe integrity path');
+      if (sha256File(target) !== entry.sha256) throw new Error(`resource changed: ${entry.path}`);
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : 'unknown integrity failure' };
+  }
+}
+
 function sendNative(message) {
   const line = `${JSON.stringify(message)}\n`;
   if (!nativeBridgeReady || !nativeBridge?.stdin?.writable) {
+    if (nativeQueue.length >= MAX_NATIVE_QUEUE) nativeQueue.shift();
     nativeQueue.push(line);
     return;
   }
@@ -148,6 +255,57 @@ function runSystemAction(action) {
   child.unref();
 }
 
+async function transcribeAudio(chunks, mimeType) {
+  if (transcriptionInProgress) throw new Error('Another dictation is already being transcribed.');
+  const normalizedMime = typeof mimeType === 'string' ? mimeType.toLowerCase() : '';
+  const allowedMimeTypes = new Set(['audio/webm', 'audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg', 'audio/ogg;codecs=opus']);
+  if (!allowedMimeTypes.has(normalizedMime) || !Array.isArray(chunks) || chunks.length < 1 || chunks.length > 2_048) {
+    throw new Error('The recorded audio was invalid.');
+  }
+  const encodedLength = chunks.reduce((total, chunk) => total + (typeof chunk === 'string' ? chunk.length : MAX_AUDIO_BYTES * 2), 0);
+  if (encodedLength > Math.ceil(MAX_AUDIO_BYTES * 4 / 3) + chunks.length * 4) throw new Error('Dictation is too long. Keep it under 90 seconds.');
+  const buffers = chunks.map((chunk) => {
+    if (typeof chunk !== 'string' || chunk.length > 64 * 1024 || !/^[A-Za-z0-9+/]*={0,2}$/.test(chunk)) {
+      throw new Error('The recorded audio was invalid.');
+    }
+    return Buffer.from(chunk, 'base64');
+  });
+  const audio = Buffer.concat(buffers);
+  if (!audio.length || audio.length > MAX_AUDIO_BYTES) throw new Error('Dictation is too long. Keep it under 90 seconds.');
+
+  const now = Date.now();
+  transcriptionTimes = transcriptionTimes.filter((time) => now - time < 5 * 60_000);
+  if (transcriptionTimes.length >= 10) throw new Error('Dictation rate limit reached. Try again in a few minutes.');
+  transcriptionTimes.push(now);
+  transcriptionInProgress = true;
+  try {
+    const extension = normalizedMime.includes('mp4') ? 'mp4' : normalizedMime.includes('ogg') ? 'ogg' : 'webm';
+    const form = new FormData();
+    form.append('file', new Blob([audio], { type: normalizedMime }), `dictation.${extension}`);
+    form.append('model', GROQ_WHISPER_MODEL);
+    form.append('response_format', 'json');
+    form.append('temperature', '0');
+    const response = await fetch(GROQ_TRANSCRIPTION_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${readGroqApiKey()}` },
+      body: form,
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) throw new Error('Groq rejected the saved API key. Check it in the companion.');
+      if (response.status === 429) throw new Error('Groq rate-limited this request. Try again shortly.');
+      throw new Error(`Groq transcription failed with status ${response.status}.`);
+    }
+    const result = await response.json();
+    const text = typeof result?.text === 'string' ? result.text.trim() : '';
+    if (!text) throw new Error('No speech was detected.');
+    if (text.length > 16_384) throw new Error('The transcript was too long to insert safely.');
+    return text;
+  } finally {
+    transcriptionInProgress = false;
+  }
+}
+
 function isTrustedRendererUrl(value) {
   try {
     const url = new URL(value);
@@ -195,20 +353,33 @@ function setScreenBlanked(enabled) {
 }
 
 function registerIpc() {
-  ipcMain.handle('compctrl:get-settings', () => ({
-    ...settings,
-    screenBlanked,
-    computerName: os.hostname(),
-    version: app.getVersion(),
-  }));
+  ipcMain.handle('compctrl:get-settings', (event) => {
+    assertTrustedIpc(event);
+    return {
+      pairingCode: settings.pairingCode,
+      controllerUrl: settings.controllerUrl,
+      jigglerEnabled: settings.jigglerEnabled,
+      autoStart: settings.autoStart,
+      groqKeyConfigured: hasGroqApiKey(),
+      screenBlanked,
+      computerName: os.hostname(),
+      version: app.getVersion(),
+    };
+  });
 
-  ipcMain.handle('compctrl:save-settings', (_event, changes) => {
+  ipcMain.handle('compctrl:save-settings', (event, changes) => {
+    assertTrustedIpc(event);
     const next = { ...settings };
-    if (typeof changes?.pairingCode === 'string' && /^[A-Z2-9]{8}$/.test(changes.pairingCode)) {
+    if (typeof changes?.pairingCode === 'string' && new RegExp(`^[A-Z2-9]{${CODE_LENGTH}}$`).test(changes.pairingCode)) {
       next.pairingCode = changes.pairingCode;
     }
     if (typeof changes?.controllerUrl === 'string' && changes.controllerUrl.length < 2048) {
-      next.controllerUrl = changes.controllerUrl;
+      try {
+        const url = new URL(changes.controllerUrl);
+        if (url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname))) {
+          next.controllerUrl = url.toString();
+        }
+      } catch { /* Ignore invalid controller addresses. */ }
     }
     if (typeof changes?.autoStart === 'boolean') {
       next.autoStart = changes.autoStart;
@@ -218,22 +389,38 @@ function registerIpc() {
     writeSettings(settings);
   });
 
-  ipcMain.handle('compctrl:dispatch', (_event, message) => {
-    if (!message || typeof message !== 'object') return;
-    const allowed = new Set(['pointer', 'wheel', 'key', 'text']);
-    if (allowed.has(message.type)) sendNative(message);
+  ipcMain.handle('compctrl:dispatch', (event, message) => {
+    assertTrustedIpc(event);
+    if (isNativeMessage(message)) sendNative(message);
   });
 
-  ipcMain.handle('compctrl:set-jiggler', (_event, enabled) => {
+  ipcMain.handle('compctrl:set-jiggler', (event, enabled) => {
+    assertTrustedIpc(event);
+    if (typeof enabled !== 'boolean') return;
     settings.jigglerEnabled = Boolean(enabled);
     writeSettings(settings);
     configureJiggler(settings.jigglerEnabled);
   });
 
-  ipcMain.handle('compctrl:set-display-blanked', (_event, enabled) => setScreenBlanked(enabled));
+  ipcMain.handle('compctrl:set-display-blanked', (event, enabled) => {
+    assertTrustedIpc(event);
+    if (typeof enabled !== 'boolean') return screenBlanked;
+    return setScreenBlanked(enabled);
+  });
 
-  ipcMain.handle('compctrl:system-action', (_event, action) => {
+  ipcMain.handle('compctrl:system-action', (event, action) => {
+    assertTrustedIpc(event);
     if (action === 'restart' || action === 'shutdown') runSystemAction(action);
+  });
+
+  ipcMain.handle('compctrl:set-groq-api-key', (event, value) => {
+    assertTrustedIpc(event);
+    return setGroqApiKey(value);
+  });
+
+  ipcMain.handle('compctrl:transcribe-audio', (event, chunks, audioMimeType) => {
+    assertTrustedIpc(event);
+    return transcribeAudio(chunks, audioMimeType);
   });
 }
 
@@ -254,10 +441,17 @@ function mimeType(filePath) {
 function startStaticServer() {
   const webRoot = path.join(process.resourcesPath, 'web');
   staticServer = http.createServer((request, response) => {
-    const requestPath = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
+    let requestPath;
+    try {
+      requestPath = decodeURIComponent(new URL(request.url, 'http://127.0.0.1').pathname);
+    } catch {
+      response.writeHead(400).end('Bad request');
+      return;
+    }
     const requested = requestPath === '/' ? 'index.html' : requestPath.replace(/^\/+/, '');
     let filePath = path.resolve(webRoot, requested);
-    if (!filePath.startsWith(path.resolve(webRoot))) {
+    const relativePath = path.relative(path.resolve(webRoot), filePath);
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
       response.writeHead(403).end('Forbidden');
       return;
     }
@@ -266,8 +460,11 @@ function startStaticServer() {
     response.setHeader('Cache-Control', requested === 'index.html' ? 'no-cache' : 'public, max-age=31536000, immutable');
     response.setHeader(
       'Content-Security-Policy',
-      "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://0.peerjs.com wss://0.peerjs.com https://*.peerjs.com wss://*.peerjs.com;",
+      "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://0.peerjs.com wss://0.peerjs.com https://*.peerjs.com wss://*.peerjs.com; worker-src 'self' blob:;",
     );
+    response.setHeader('X-Content-Type-Options', 'nosniff');
+    response.setHeader('Referrer-Policy', 'no-referrer');
+    response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
     fs.createReadStream(filePath).pipe(response);
   });
   return new Promise((resolve) => staticServer.listen(0, '127.0.0.1', () => resolve(staticServer.address().port)));
@@ -298,6 +495,8 @@ async function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       backgroundThrottling: false,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
   });
 
@@ -311,6 +510,10 @@ async function createWindow() {
     if (url.startsWith('https://') || url.startsWith('http://localhost')) void shell.openExternal(url);
     return { action: 'deny' };
   });
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedRendererUrl(url)) event.preventDefault();
+  });
+  mainWindow.webContents.session.on('will-download', (event) => event.preventDefault());
   await mainWindow.loadURL(rendererUrl);
 }
 
@@ -326,6 +529,15 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   app.on('second-instance', () => { mainWindow?.show(); mainWindow?.focus(); });
   app.whenReady().then(async () => {
+    const integrity = verifyBundledIntegrity();
+    if (!integrity.ok) {
+      dialog.showErrorBox(
+        'CompCtrl integrity check failed',
+        `A packaged application file was changed or damaged. Reinstall CompCtrl from a verified download.\n\n${integrity.message}`,
+      );
+      app.quit();
+      return;
+    }
     settings = readSettings();
     writeSettings(settings);
     registerIpc();

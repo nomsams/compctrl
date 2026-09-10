@@ -11,11 +11,13 @@ import {
   ExternalLink,
   Laptop,
   Link2,
+  KeyRound,
   MonitorUp,
   MousePointer2,
   RefreshCw,
   ShieldCheck,
   Smartphone,
+  Trash2,
   Unplug,
   Wifi,
   WifiOff,
@@ -28,9 +30,12 @@ import { newPeer } from '@/lib/peer';
 import {
   type ControllerMessage,
   type HostMessage,
+  CODE_LENGTH,
   PROTOCOL_VERSION,
+  authProofForCode,
   cleanCode,
   createPairingCode,
+  createSecurityToken,
   isControllerMessage,
   peerIdForCode,
 } from '@/lib/protocol';
@@ -54,17 +59,22 @@ export function HostController() {
   const api = window.compCtrl;
   const [hostState, setHostState] = useState<HostState>('starting');
   const [pairingCode, setPairingCode] = useState('');
+  const [hostPeerId, setHostPeerId] = useState('');
   const [computerName, setComputerName] = useState('Windows PC');
   const [controllerUrl, setControllerUrl] = useState('');
   const [urlDraft, setUrlDraft] = useState('');
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
   const [screenBlanked, setScreenBlanked] = useState(false);
   const [autoStart, setAutoStart] = useState(true);
+  const [groqKeyConfigured, setGroqKeyConfigured] = useState(false);
+  const [groqKeyDraft, setGroqKeyDraft] = useState('');
   const [controllerName, setControllerName] = useState('Phone');
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState('Starting secure session…');
   const jigglerRef = useRef(false);
   const screenBlankedRef = useRef(false);
+  const groqKeyConfiguredRef = useRef(false);
+  const dictationsRef = useRef(new Map<string, { mimeType: string; chunks: Map<number, string>; encodedBytes: number }>());
   const connectionRef = useRef<DataConnection | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -82,6 +92,18 @@ export function HostController() {
 
   useEffect(() => { jigglerRef.current = jigglerEnabled; }, [jigglerEnabled]);
   useEffect(() => { screenBlankedRef.current = screenBlanked; }, [screenBlanked]);
+  useEffect(() => { groqKeyConfiguredRef.current = groqKeyConfigured; }, [groqKeyConfigured]);
+
+  useEffect(() => {
+    if (!pairingCode) {
+      setHostPeerId('');
+      return;
+    }
+    let disposed = false;
+    setHostPeerId('');
+    void peerIdForCode(pairingCode).then((id) => { if (!disposed) setHostPeerId(id); });
+    return () => { disposed = true; };
+  }, [pairingCode]);
 
   const send = useCallback((message: HostMessage) => {
     if (connectionRef.current?.open) void connectionRef.current.send(message);
@@ -96,14 +118,65 @@ export function HostController() {
     if (message.type === 'jiggler') {
       await api.setJiggler(message.enabled);
       setJigglerEnabled(message.enabled);
-      send({ type: 'status', jigglerEnabled: message.enabled, screenBlanked: screenBlankedRef.current });
+      send({ type: 'status', jigglerEnabled: message.enabled, screenBlanked: screenBlankedRef.current, dictationAvailable: groqKeyConfiguredRef.current });
       return;
     }
     if (message.type === 'display') {
       const blanked = await api.setDisplayBlanked(message.blanked);
       setScreenBlanked(blanked);
       setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
-      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
+      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked, dictationAvailable: groqKeyConfiguredRef.current });
+      return;
+    }
+    if (message.type === 'dictation-start') {
+      if (!groqKeyConfiguredRef.current) {
+        send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Add a Groq API key in the Windows companion first.' });
+        return;
+      }
+      dictationsRef.current.clear();
+      dictationsRef.current.set(message.id, { mimeType: message.mimeType, chunks: new Map(), encodedBytes: 0 });
+      send({ type: 'dictation-status', id: message.id, status: 'receiving', message: 'Receiving voice recording…' });
+      return;
+    }
+    if (message.type === 'dictation-chunk') {
+      const recording = dictationsRef.current.get(message.id);
+      if (!recording || recording.chunks.has(message.index)) return;
+      recording.encodedBytes += message.data.length;
+      if (recording.encodedBytes > 28 * 1024 * 1024) {
+        dictationsRef.current.delete(message.id);
+        send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Recording is too large. Keep dictation under 90 seconds.' });
+        return;
+      }
+      recording.chunks.set(message.index, message.data);
+      return;
+    }
+    if (message.type === 'dictation-end') {
+      const recording = dictationsRef.current.get(message.id);
+      if (!recording || recording.chunks.size !== message.totalChunks) {
+        dictationsRef.current.delete(message.id);
+        send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Some recorded audio was lost. Please try again.' });
+        return;
+      }
+      const chunks = Array.from({ length: message.totalChunks }, (_, index) => recording.chunks.get(index) ?? '');
+      if (chunks.some((chunk) => !chunk)) {
+        dictationsRef.current.delete(message.id);
+        send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Some recorded audio was lost. Please try again.' });
+        return;
+      }
+      dictationsRef.current.delete(message.id);
+      send({ type: 'dictation-status', id: message.id, status: 'transcribing', message: 'Groq is transcribing…' });
+      try {
+        const transcript = await api.transcribeAudio(chunks, recording.mimeType);
+        await api.dispatch({ type: 'text', text: transcript });
+        send({ type: 'dictation-status', id: message.id, status: 'done', message: `Inserted ${transcript.length} characters.` });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : 'Transcription failed.';
+        send({ type: 'dictation-status', id: message.id, status: 'error', message: detail.slice(0, 256) });
+      }
+      return;
+    }
+    if (message.type === 'dictation-cancel') {
+      dictationsRef.current.delete(message.id);
       return;
     }
     if (message.type === 'stream') {
@@ -122,7 +195,8 @@ export function HostController() {
     let disposed = false;
     void api.getSettings().then((settings) => {
       if (disposed) return;
-      const code = cleanCode(settings.pairingCode) || createPairingCode();
+      const storedCode = cleanCode(settings.pairingCode);
+      const code = storedCode.length === CODE_LENGTH ? storedCode : createPairingCode();
       setPairingCode(code);
       setComputerName(settings.computerName);
       setControllerUrl(settings.controllerUrl);
@@ -130,6 +204,7 @@ export function HostController() {
       setJigglerEnabled(settings.jigglerEnabled);
       setScreenBlanked(settings.screenBlanked);
       setAutoStart(settings.autoStart);
+      setGroqKeyConfigured(settings.groqKeyConfigured);
       void api.saveSettings({ pairingCode: code });
     });
     return () => { disposed = true; };
@@ -140,20 +215,21 @@ export function HostController() {
     return api.onDisplayState((blanked) => {
       setScreenBlanked(blanked);
       setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
-      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
+      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked, dictationAvailable: groqKeyConfiguredRef.current });
     });
   }, [api, send]);
 
   useEffect(() => {
-    if (!api || !pairingCode) return;
+    if (!api || !pairingCode || !hostPeerId) return;
     let disposed = false;
-    const peer = newPeer(peerIdForCode(pairingCode));
+    const peer = newPeer(hostPeerId);
+    const pendingConnections = new Set<DataConnection>();
     peerRef.current = peer;
     setHostState('starting');
     setNotice('Opening P2P rendezvous…');
 
-    const returnToReady = () => {
-      if (disposed) return;
+    const returnToReady = (closedConnection?: DataConnection) => {
+      if (disposed || (closedConnection && connectionRef.current !== closedConnection)) return;
       connectionRef.current = null;
       shareScreenRef.current = null;
       stopStream();
@@ -206,29 +282,92 @@ export function HostController() {
 
     peer.on('connection', (incoming) => {
       const metadata = incoming.metadata as { role?: string; protocol?: number; deviceName?: string } | undefined;
-      if (metadata?.role !== 'controller' || metadata.protocol !== PROTOCOL_VERSION) {
+      if (metadata?.role !== 'controller' || metadata.protocol !== PROTOCOL_VERSION || pendingConnections.size >= 3) {
         incoming.close();
         return;
       }
-      connectionRef.current?.close();
-      stopStream();
-      connectionRef.current = incoming;
-      setControllerName(metadata.deviceName || 'Phone');
-      setHostState('starting');
-      setNotice('Phone found — securing connection…');
+      pendingConnections.add(incoming);
+      let authenticated = false;
+      let authenticating = false;
+      let challenge = '';
+      let messageWindowStarted = Date.now();
+      let messagesInWindow = 0;
+      const authDeadline = window.setTimeout(() => incoming.close(), 8_000);
 
       incoming.on('open', () => {
-        setHostState('connected');
-        setNotice('Phone connected — starting screen…');
-        shareScreenRef.current = () => shareScreenWith(incoming.peer);
-        void incoming.send({ type: 'ready', computerName, jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current } satisfies HostMessage);
-        void shareScreenWith(incoming.peer);
+        challenge = createSecurityToken();
+        setNotice('Phone found — verifying pairing secret…');
+        void incoming.send({ type: 'auth-challenge', challenge } satisfies HostMessage);
       });
       incoming.on('data', (data) => {
-        if (isControllerMessage(data)) void handleControllerMessage(data);
+        if (!isControllerMessage(data)) {
+          incoming.close();
+          return;
+        }
+        if (!authenticated) {
+          if (authenticating || data.type !== 'auth-response' || data.challenge !== challenge) {
+            incoming.close();
+            return;
+          }
+          authenticating = true;
+          void authProofForCode(pairingCode, challenge, data.nonce).then((expectedProof) => {
+            if (disposed || data.proof !== expectedProof) {
+              incoming.close();
+              return;
+            }
+            authenticated = true;
+            window.clearTimeout(authDeadline);
+            pendingConnections.delete(incoming);
+            const previous = connectionRef.current;
+            connectionRef.current = incoming;
+            previous?.close();
+            stopStream();
+            const safeName = typeof metadata.deviceName === 'string'
+              ? metadata.deviceName.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone'
+              : 'Phone';
+            setControllerName(safeName);
+            setHostState('connected');
+            setNotice('Phone authenticated — starting screen…');
+            shareScreenRef.current = () => shareScreenWith(incoming.peer);
+            void incoming.send({ type: 'auth-ok' } satisfies HostMessage);
+            void incoming.send({
+              type: 'ready',
+              computerName,
+              jigglerEnabled: jigglerRef.current,
+              screenBlanked: screenBlankedRef.current,
+              dictationAvailable: groqKeyConfiguredRef.current,
+            } satisfies HostMessage);
+            void shareScreenWith(incoming.peer);
+          }).catch(() => incoming.close());
+          return;
+        }
+        if (connectionRef.current !== incoming) {
+          incoming.close();
+          return;
+        }
+        const now = Date.now();
+        if (now - messageWindowStarted >= 1_000) {
+          messageWindowStarted = now;
+          messagesInWindow = 0;
+        }
+        messagesInWindow += 1;
+        if (messagesInWindow > 400) {
+          setNotice('Disconnected a controller that exceeded the safety rate limit.');
+          incoming.close();
+          return;
+        }
+        if (data.type !== 'auth-response') void handleControllerMessage(data);
       });
-      incoming.on('close', returnToReady);
-      incoming.on('error', returnToReady);
+      incoming.on('close', () => {
+        window.clearTimeout(authDeadline);
+        pendingConnections.delete(incoming);
+        returnToReady(incoming);
+      });
+      incoming.on('error', () => {
+        window.clearTimeout(authDeadline);
+        pendingConnections.delete(incoming);
+        returnToReady(incoming);
+      });
     });
 
     peer.on('disconnected', () => {
@@ -262,7 +401,7 @@ export function HostController() {
       if (!peer.destroyed) peer.destroy();
       peerRef.current = null;
     };
-  }, [api, computerName, handleControllerMessage, pairingCode, send, stopStream]);
+  }, [api, computerName, handleControllerMessage, hostPeerId, pairingCode, send, stopStream]);
 
   const pairingUrl = useMemo(() => {
     const base = normalizeControllerUrl(controllerUrl);
@@ -289,6 +428,28 @@ export function HostController() {
     setNotice('Controller address saved');
   };
 
+  const saveGroqKey = async () => {
+    if (!api || !groqKeyDraft.trim()) return;
+    try {
+      const configured = await api.setGroqApiKey(groqKeyDraft);
+      setGroqKeyConfigured(configured);
+      setGroqKeyDraft('');
+      setNotice('Groq key encrypted for this Windows account');
+      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current, dictationAvailable: configured });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not save the Groq key');
+    }
+  };
+
+  const removeGroqKey = async () => {
+    if (!api) return;
+    await api.setGroqApiKey('');
+    setGroqKeyConfigured(false);
+    setGroqKeyDraft('');
+    setNotice('Saved Groq key removed');
+    send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current, dictationAvailable: false });
+  };
+
   const copyCode = async () => {
     await navigator.clipboard.writeText(pairingCode);
     setCopied(true);
@@ -312,7 +473,7 @@ export function HostController() {
             <h1>{hostState === 'connected' ? `${controllerName} is connected` : 'Scan or enter this code'}</h1>
             <p>{hostState === 'connected' ? 'Your screen and controls are traveling directly between this PC and your phone.' : 'Open the controller on your phone. This code stays valid while the companion is running.'}</p>
             <div className="pair-code-display" aria-label={`Pairing code ${pairingCode}`}>
-              <button type="button" onClick={copyCode}>{pairingCode.slice(0, 4)} <span>{pairingCode.slice(4)}</span>{copied ? <Check /> : <Copy />}</button>
+              <button type="button" onClick={copyCode}>{pairingCode.slice(0, 4)} <span>{pairingCode.slice(4, 8)}</span> {pairingCode.slice(8)}{copied ? <Check /> : <Copy />}</button>
             </div>
             <div className="flex flex-wrap gap-2">
               {hostState === 'connected' ? (
@@ -366,7 +527,7 @@ export function HostController() {
                 onCheckedChange={(enabled) => {
                   setJigglerEnabled(enabled);
                   void api?.setJiggler(enabled);
-                  send({ type: 'status', jigglerEnabled: enabled, screenBlanked: screenBlankedRef.current });
+                  send({ type: 'status', jigglerEnabled: enabled, screenBlanked: screenBlankedRef.current, dictationAvailable: groqKeyConfiguredRef.current });
                 }}
               />
             </div>
@@ -378,7 +539,7 @@ export function HostController() {
                 onCheckedChange={(blanked) => {
                   setScreenBlanked(blanked);
                   void api?.setDisplayBlanked(blanked);
-                  send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
+                  send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked, dictationAvailable: groqKeyConfiguredRef.current });
                 }}
               />
             </div>
@@ -391,6 +552,23 @@ export function HostController() {
               <Button onClick={saveControllerUrl}>Save</Button>
             </div>
             <p className="host-note"><CircleHelp /> Paste the address shown by GitHub Pages after publishing this project.</p>
+          </section>
+
+          <section className="host-settings-card host-wide-card">
+            <div className="section-heading"><div><h2>Groq voice dictation</h2><p>The key is encrypted locally and used only by this companion for Whisper transcription.</p></div><KeyRound /></div>
+            <div className="secret-setting">
+              <Input
+                type="password"
+                value={groqKeyDraft}
+                onChange={(event) => setGroqKeyDraft(event.target.value)}
+                placeholder={groqKeyConfigured ? 'Groq key saved — enter a replacement' : 'Paste Groq API key'}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <Button onClick={() => void saveGroqKey()} disabled={!groqKeyDraft.trim()}>Save key</Button>
+              {groqKeyConfigured && <Button variant="outline" size="icon" onClick={() => void removeGroqKey()} aria-label="Remove saved Groq API key"><Trash2 /></Button>}
+            </div>
+            <p className="host-note"><ShieldCheck /> {groqKeyConfigured ? 'Dictation is ready. Focus a Windows text field, then tap Voice on your phone.' : 'The phone never receives or stores this key.'}</p>
           </section>
         </div>
 

@@ -18,9 +18,22 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm run test:geometry
       - run: npm run pack:windows
+      - name: Verify generated checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem release/CompCtrl-*.exe | ForEach-Object {
+            ./Verify-CompCtrl.ps1 -FilePath $_.FullName -ChecksumFile release/SHA256SUMS.txt
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: CompCtrl-Windows
-          path: release/*.exe
+          path: |
+            release/*.exe
+            release/*.sha256
+            release/SHA256SUMS.txt
+            Verify-CompCtrl.ps1
           if-no-files-found: error

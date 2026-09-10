@@ -5,6 +5,7 @@ import {
   Camera,
   Clipboard,
   Copy,
+  CornerDownLeft,
   Crosshair,
   EyeOff,
   ChevronDown,
@@ -16,6 +17,8 @@ import {
   Menu,
   Minimize2,
   Monitor,
+  Mic,
+  MicOff,
   MousePointer2,
   MousePointerClick,
   PictureInPicture2,
@@ -82,12 +85,23 @@ import {
   type ConnectionState,
   type ControllerMessage,
   type HostMessage,
+  PROTOCOL_VERSION,
+  authProofForCode,
   cleanCode,
+  createSecurityToken,
+  isHostMessage,
   pairingCodeFromQr,
   peerIdForCode,
 } from '@/lib/protocol';
 
 type Modifier = 'Control' | 'Alt' | 'Shift' | 'Meta';
+type DictationState = 'idle' | 'recording' | 'sending' | 'transcribing' | 'done' | 'error';
+
+function bytesToBase64(bytes: Uint8Array) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
 
 type WebkitPiPVideo = HTMLVideoElement & {
   webkitPresentationMode?: string;
@@ -176,6 +190,9 @@ export function RemoteController() {
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
   const [screenBlanked, setScreenBlanked] = useState(false);
   const [displayControlSupported, setDisplayControlSupported] = useState(false);
+  const [dictationAvailable, setDictationAvailable] = useState(false);
+  const [dictationState, setDictationState] = useState<DictationState>('idle');
+  const [dictationMessage, setDictationMessage] = useState('');
   const [hostNotice, setHostNotice] = useState('');
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scannerStatus, setScannerStatus] = useState('Starting camera…');
@@ -185,6 +202,11 @@ export function RemoteController() {
   const lastPongRef = useRef(0);
   const scannerVideoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<QrScanner | null>(null);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recorderStreamRef = useRef<MediaStream | null>(null);
+  const dictationChunksRef = useRef<Blob[]>([]);
+  const dictationIdRef = useRef('');
+  const dictationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     const initial = readInitialCode();
@@ -201,6 +223,103 @@ export function RemoteController() {
     void connection.send(message);
     return true;
   }, []);
+
+  const stopRecorderTracks = useCallback(() => {
+    recorderStreamRef.current?.getTracks().forEach((track) => track.stop());
+    recorderStreamRef.current = null;
+    if (dictationTimerRef.current) clearTimeout(dictationTimerRef.current);
+    dictationTimerRef.current = null;
+  }, []);
+
+  const stopDictation = useCallback(() => {
+    const recorder = recorderRef.current;
+    if (recorder?.state === 'recording') recorder.stop();
+  }, []);
+
+  const startDictation = useCallback(async () => {
+    if (!dictationAvailable) {
+      setDictationState('error');
+      setDictationMessage('Add a Groq API key in the Windows companion first.');
+      return;
+    }
+    if (!connectionRef.current?.open || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+      setDictationState('error');
+      setDictationMessage('Voice recording is unavailable in this browser.');
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        video: false,
+      });
+      const mimeType = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus', 'audio/ogg']
+        .find((candidate) => MediaRecorder.isTypeSupported(candidate));
+      if (!mimeType) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error('This browser cannot create a supported voice recording.');
+      }
+
+      const id = createSecurityToken(12);
+      const recorder = new MediaRecorder(stream, { mimeType });
+      recorderRef.current = recorder;
+      recorderStreamRef.current = stream;
+      dictationChunksRef.current = [];
+      dictationIdRef.current = id;
+      recorder.ondataavailable = (event) => {
+        if (event.data.size) dictationChunksRef.current.push(event.data);
+      };
+      recorder.onerror = () => {
+        setDictationState('error');
+        setDictationMessage('The microphone recording failed.');
+        stopRecorderTracks();
+      };
+      recorder.onstop = () => {
+        recorderRef.current = null;
+        stopRecorderTracks();
+        setDictationState('sending');
+        setDictationMessage('Sending encrypted audio to the computer…');
+        void (async () => {
+          const audio = new Uint8Array(await new Blob(dictationChunksRef.current, { type: mimeType }).arrayBuffer());
+          dictationChunksRef.current = [];
+          if (!audio.length) throw new Error('No audio was recorded.');
+          if (audio.length > 20 * 1024 * 1024) throw new Error('Recording is too large. Keep dictation under 90 seconds.');
+          const chunkSize = 45 * 1024;
+          const totalChunks = Math.ceil(audio.length / chunkSize);
+          for (let index = 0; index < totalChunks; index += 1) {
+            const data = bytesToBase64(audio.subarray(index * chunkSize, Math.min(audio.length, (index + 1) * chunkSize)));
+            if (!send({ type: 'dictation-chunk', id, index, data })) throw new Error('The computer connection was lost.');
+          }
+          if (!send({ type: 'dictation-end', id, totalChunks })) throw new Error('The computer connection was lost.');
+        })().catch((error) => {
+          send({ type: 'dictation-cancel', id });
+          setDictationState('error');
+          setDictationMessage(error instanceof Error ? error.message : 'Could not send the recording.');
+        });
+      };
+
+      if (!send({ type: 'dictation-start', id, mimeType })) {
+        stream.getTracks().forEach((track) => track.stop());
+        throw new Error('The computer connection was lost.');
+      }
+      recorder.start(1_000);
+      setDictationState('recording');
+      setDictationMessage('Listening… tap again to transcribe.');
+      dictationTimerRef.current = setTimeout(() => {
+        if (recorder.state === 'recording') recorder.stop();
+      }, 90_000);
+    } catch (error) {
+      stopRecorderTracks();
+      recorderRef.current = null;
+      setDictationState('error');
+      const detail = error instanceof Error ? error.message : 'Microphone access failed.';
+      setDictationMessage(/notallowed|permission|denied/i.test(detail) ? 'Allow microphone access in the browser, then try again.' : detail);
+    }
+  }, [dictationAvailable, send, stopRecorderTracks]);
+
+  const toggleDictation = useCallback(() => {
+    if (dictationState === 'recording') stopDictation();
+    else if (!['sending', 'transcribing'].includes(dictationState)) void startDictation();
+  }, [dictationState, startDictation, stopDictation]);
 
   const beginSession = useCallback((value: string) => {
     const nextCode = cleanCode(value);
@@ -267,10 +386,19 @@ export function RemoteController() {
     let attempt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let mediaRetryTimer: ReturnType<typeof setTimeout> | null = null;
-    let peer = newPeer();
+    let peer: ReturnType<typeof newPeer> | null = null;
     let connection: DataConnection | null = null;
 
     const cleanTransport = () => {
+      const recorder = recorderRef.current;
+      if (recorder?.state === 'recording') {
+        recorder.onstop = null;
+        recorder.stop();
+      }
+      recorderRef.current = null;
+      stopRecorderTracks();
+      setDictationState('idle');
+      setDictationAvailable(false);
       connection?.close();
       const activeCall = callRef.current;
       callRef.current = null;
@@ -278,11 +406,12 @@ export function RemoteController() {
       streamRef.current = null;
       setStream(null);
       connectionRef.current = null;
-      if (!peer.destroyed) peer.destroy();
+      if (peer && !peer.destroyed) peer.destroy();
     };
 
     const scheduleReconnect = () => {
       if (disposed || retryTimer) return;
+      setDictationAvailable(false);
       setConnectionState(navigator.onLine ? 'reconnecting' : 'offline');
       setHostNotice(navigator.onLine ? 'Control connection lost. Reconnecting…' : 'Phone is offline.');
       streamRef.current = null;
@@ -301,44 +430,67 @@ export function RemoteController() {
       if (disposed) return;
       setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
       setDisplayControlSupported(false);
-      peer = newPeer();
+      const activePeer = newPeer();
+      peer = activePeer;
 
-      peer.on('open', () => {
+      activePeer.on('open', () => {
         if (disposed) return;
-        connection = peer.connect(peerIdForCode(sessionCode), {
-          reliable: true,
-          serialization: 'json',
-          metadata: { role: 'controller', protocol: 1 },
-        });
-        connectionRef.current = connection;
+        void peerIdForCode(sessionCode).then((hostId) => {
+          if (disposed || activePeer.destroyed) return;
+          connection = activePeer.connect(hostId, {
+            reliable: true,
+            serialization: 'json',
+            metadata: { role: 'controller', protocol: PROTOCOL_VERSION },
+          });
 
-        connection.on('open', () => {
-          attempt = 0;
-          setRetryCount(0);
-          lastPongRef.current = Date.now();
-          setConnectionState('connected');
-          setHostNotice('Connected. Waiting for desktop video…');
-          window.localStorage.setItem('compctrl.lastCode', sessionCode);
-          window.localStorage.setItem('compctrl.autoReconnect', 'true');
-          if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
-          mediaRetryTimer = setTimeout(() => {
-            if (!disposed && connectionRef.current?.open && !callRef.current) {
-              setHostNotice('Requesting the desktop video again…');
-              send({ type: 'stream', action: 'request' });
+          connection.on('open', () => {
+            setHostNotice('Authenticating this phone…');
+          });
+          connection.on('data', (data) => {
+            if (!isHostMessage(data)) {
+              connection?.close();
+              return;
             }
-          }, 4500);
-        });
-        connection.on('data', (data) => {
-          const message = data as HostMessage;
+            const message: HostMessage = data;
+            if (message.type === 'auth-challenge') {
+              const nonce = createSecurityToken();
+              void authProofForCode(sessionCode, message.challenge, nonce).then((proof) => {
+                if (!disposed && connection?.open) {
+                  void connection.send({ type: 'auth-response', challenge: message.challenge, nonce, proof } satisfies ControllerMessage);
+                }
+              }).catch(scheduleReconnect);
+              return;
+            }
+            if (message.type === 'auth-ok') {
+              if (!connection) return;
+              connectionRef.current = connection;
+              attempt = 0;
+              setRetryCount(0);
+              lastPongRef.current = Date.now();
+              setConnectionState('connected');
+              setHostNotice('Authenticated. Waiting for desktop video…');
+              window.localStorage.setItem('compctrl.lastCode', sessionCode);
+              window.localStorage.setItem('compctrl.autoReconnect', 'true');
+              if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
+              mediaRetryTimer = setTimeout(() => {
+                if (!disposed && connectionRef.current?.open && !callRef.current) {
+                  setHostNotice('Requesting the desktop video again…');
+                  send({ type: 'stream', action: 'request' });
+                }
+              }, 4500);
+              return;
+            }
           if (message.type === 'ready') {
             setComputerName(message.computerName);
             setJigglerEnabled(message.jigglerEnabled);
+            setDictationAvailable(message.dictationAvailable);
             const supported = typeof message.screenBlanked === 'boolean';
             setDisplayControlSupported(supported);
             setScreenBlanked(supported && message.screenBlanked);
             setHostNotice('Connected. Starting desktop video…');
           } else if (message.type === 'status') {
             setJigglerEnabled(message.jigglerEnabled);
+            setDictationAvailable(message.dictationAvailable);
             if (typeof message.screenBlanked === 'boolean') {
               setDisplayControlSupported(true);
               setScreenBlanked(message.screenBlanked);
@@ -347,13 +499,24 @@ export function RemoteController() {
             lastPongRef.current = Date.now();
           } else if (message.type === 'notice') {
             setHostNotice(message.message);
+          } else if (message.type === 'dictation-status' && message.id === dictationIdRef.current) {
+            setDictationMessage(message.message);
+            if (message.status === 'transcribing') setDictationState('transcribing');
+            else if (message.status === 'done') setDictationState('done');
+            else if (message.status === 'error') setDictationState('error');
           }
-        });
-        connection.on('close', scheduleReconnect);
-        connection.on('error', scheduleReconnect);
+          });
+          connection.on('close', scheduleReconnect);
+          connection.on('error', scheduleReconnect);
+        }).catch(scheduleReconnect);
       });
 
-      peer.on('call', (incomingCall) => {
+      activePeer.on('call', (incomingCall) => {
+        const metadata = incomingCall.metadata as { protocol?: number } | undefined;
+        if (!connectionRef.current?.open || incomingCall.peer !== connectionRef.current.peer || metadata?.protocol !== PROTOCOL_VERSION) {
+          incomingCall.close();
+          return;
+        }
         const previousCall = callRef.current;
         callRef.current = null;
         previousCall?.close();
@@ -395,9 +558,9 @@ export function RemoteController() {
         incomingCall.on('error', recoverMedia);
       });
 
-      peer.on('disconnected', scheduleReconnect);
-      peer.on('close', scheduleReconnect);
-      peer.on('error', scheduleReconnect);
+      activePeer.on('disconnected', scheduleReconnect);
+      activePeer.on('close', scheduleReconnect);
+      activePeer.on('error', scheduleReconnect);
     };
 
     connect();
@@ -449,7 +612,7 @@ export function RemoteController() {
       window.removeEventListener('focus', resumeWhenVisible);
       cleanTransport();
     };
-  }, [reconnectNonce, send, sessionCode]);
+  }, [reconnectNonce, send, sessionCode, stopRecorderTracks]);
 
   const startSession = () => { beginSession(code); };
 
@@ -460,19 +623,19 @@ export function RemoteController() {
     void Promise.resolve(context.registerTool({
       name: 'connect_to_computer',
       title: 'Connect to computer',
-      description: 'Start the visible CompCtrl session using an eight-character pairing code supplied by the user.',
+      description: 'Start the visible CompCtrl session using a twelve-character pairing code supplied by the user.',
       inputSchema: {
         type: 'object',
-        properties: { code: { type: 'string', pattern: '^[A-HJ-NP-Z2-9]{8}$' } },
+        properties: { code: { type: 'string', pattern: '^[A-HJ-NP-Z2-9]{12}$' } },
         required: ['code'],
         additionalProperties: false,
       },
       annotations: { readOnlyHint: false, untrustedContentHint: false },
       execute(input) {
         const candidate = cleanCode((input as { code?: unknown })?.code as string ?? '');
-        if (candidate.length !== CODE_LENGTH) throw new Error('A valid eight-character pairing code is required.');
+        if (candidate.length !== CODE_LENGTH) throw new Error('A valid twelve-character pairing code is required.');
         beginSession(candidate);
-        return { status: 'connecting', code: `${candidate.slice(0, 4)} ${candidate.slice(4)}` };
+        return { status: 'connecting', code: `${candidate.slice(0, 4)} ${candidate.slice(4, 8)} ${candidate.slice(8)}` };
       },
     }, { signal: lifecycle.signal })).catch(() => undefined);
     return () => lifecycle.abort();
@@ -502,6 +665,10 @@ export function RemoteController() {
         }}
         screenBlanked={screenBlanked}
         displayControlSupported={displayControlSupported}
+        dictationAvailable={dictationAvailable}
+        dictationState={dictationState}
+        dictationMessage={dictationMessage}
+        toggleDictation={toggleDictation}
         setScreenBlanked={(blanked) => {
           if (!displayControlSupported) return;
           setScreenBlanked(blanked);
@@ -547,7 +714,7 @@ export function RemoteController() {
                 value={code}
                 onChange={(event: ChangeEvent<HTMLInputElement>) => setCode(cleanCode(event.target.value))}
                 className="h-14 flex-1 border-0 bg-transparent px-3 font-mono text-lg font-semibold uppercase tracking-[0.2em] shadow-none focus-visible:ring-0"
-                placeholder="ABCD 2345"
+                placeholder="ABCD 2345 WXYZ"
                 autoComplete="one-time-code"
                 autoCapitalize="characters"
                 spellCheck={false}
@@ -566,7 +733,7 @@ export function RemoteController() {
               <Button type="button" variant="outline" className="scan-code-button" onClick={() => setScannerOpen(true)}>
                 <Camera className="size-[18px]" /> Scan QR code
               </Button>
-              <span>or enter the 8-character code</span>
+              <span>or enter the 12-character code</span>
             </div>
             <p className="mt-3 flex items-center gap-2 text-[0.8rem] text-[var(--muted-ink)]">
               <ShieldCheck className="size-4 text-[var(--safe)]" /> Video and controls travel directly between your devices.
@@ -642,6 +809,10 @@ type RemoteSurfaceProps = {
   setJigglerEnabled(enabled: boolean): void;
   screenBlanked: boolean;
   displayControlSupported: boolean;
+  dictationAvailable: boolean;
+  dictationState: DictationState;
+  dictationMessage: string;
+  toggleDictation(): void;
   setScreenBlanked(blanked: boolean): void;
   send(message: ControllerMessage): boolean;
   disconnect(): void;
@@ -659,6 +830,10 @@ function RemoteSurface({
   setJigglerEnabled,
   screenBlanked,
   displayControlSupported,
+  dictationAvailable,
+  dictationState,
+  dictationMessage,
+  toggleDictation,
   setScreenBlanked,
   send,
   disconnect,
@@ -1227,6 +1402,8 @@ function RemoteSurface({
   };
 
   const connected = connectionState === 'connected';
+  const dictationBusy = dictationState === 'sending' || dictationState === 'transcribing';
+  const dictationLabel = dictationState === 'recording' ? 'Stop' : dictationBusy ? 'Wait' : 'Voice';
   const statusText = connected
     ? stream ? 'Live' : 'Securing video'
     : connectionState === 'offline' ? 'Phone offline' : retryCount ? `Reconnecting · ${retryCount}` : 'Connecting';
@@ -1247,7 +1424,7 @@ function RemoteSurface({
       <header className="remote-topbar">
         <div className="min-w-0">
           <div className="flex items-center gap-2"><span className={`remote-state-dot ${connected ? 'is-live' : ''}`} /><strong className="truncate">{computerName}</strong></div>
-          <p>{statusText}{screenBlanked ? ' · Displays powered off' : ''} · {code.slice(0, 4)} {code.slice(4)}</p>
+          <p>{statusText}{screenBlanked ? ' · Displays powered off' : ''} · {code.slice(0, 4)} {code.slice(4, 8)} {code.slice(8)}</p>
         </div>
         <div className="remote-topbar-actions">
           <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => void setImmersiveMode(true)} aria-label="Enter fullscreen controller">
@@ -1333,6 +1510,11 @@ function RemoteSurface({
             <EyeOff /> Displays off <small>Turn on</small>
           </button>
         )}
+        {dictationState !== 'idle' && dictationMessage && (
+          <output className={`dictation-chip is-${dictationState}`} aria-live="polite">
+            {dictationState === 'recording' ? <MicOff /> : <Mic />} {dictationMessage}
+          </output>
+        )}
         <div className={`scroll-buttons ${immersive ? 'has-clicks' : ''}`} aria-label="Pointer and scroll controls">
           {immersive && (
             <>
@@ -1350,6 +1532,16 @@ function RemoteSurface({
           <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: 360 })} disabled={!connected} aria-label="Scroll down">
             <ChevronDown /><span>Down</span>
           </button>
+          {immersive && (
+            <>
+              <button type="button" onClick={() => send({ type: 'key', action: 'tap', key: 'Enter' })} disabled={!connected} aria-label="Press Enter">
+                <CornerDownLeft /><span>Enter</span>
+              </button>
+              <button type="button" className={dictationState === 'recording' ? 'is-recording' : ''} onClick={toggleDictation} disabled={!connected || !dictationAvailable || dictationBusy} aria-label={dictationState === 'recording' ? 'Stop and transcribe voice recording' : 'Start voice dictation'}>
+                {dictationState === 'recording' ? <MicOff /> : <Mic />}<span>{dictationLabel}</span>
+              </button>
+            </>
+          )}
         </div>
       </div>
 
@@ -1368,6 +1560,9 @@ function RemoteSurface({
         </Button>
         <Button variant="secondary" className="toolbar-button" onClick={() => sendPointer('click', 'right')}>
           <MousePointer2 /><span>Right</span>
+        </Button>
+        <Button variant="secondary" className={`toolbar-button ${dictationState === 'recording' ? 'is-recording' : ''}`} onClick={toggleDictation} disabled={!connected || !dictationAvailable || dictationBusy}>
+          {dictationState === 'recording' ? <MicOff /> : <Mic />}<span>{dictationLabel}</span>
         </Button>
       </nav>
 
@@ -1571,6 +1766,11 @@ function RemoteSurface({
                 }}
                 aria-label="Open the full PC key panel from the keyboard button"
               />
+            </div>
+            <div className="control-row">
+              <span className="control-row-icon"><Mic /></span>
+              <span><strong>Groq voice dictation</strong><small>{dictationAvailable ? 'Ready · focuses the current Windows text field' : 'Add an API key in the Windows companion'}</small></span>
+              <ShieldCheck className={dictationAvailable ? 'text-emerald-400' : 'opacity-30'} />
             </div>
             <div className="control-section-label">Session</div>
             {!connected && (

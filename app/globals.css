@@ -173,10 +173,15 @@ button, input { font: inherit; }
 .screen-blank-chip { position: absolute; z-index: 12; left: .75rem; top: .75rem; display: flex; height: 2.15rem; align-items: center; gap: .4rem; border: 1px solid rgba(79,226,180,.35); border-radius: 999px; background: rgba(7,34,28,.88); padding: 0 .7rem; color: #75f0c8; font-size: .68rem; font-weight: 650; box-shadow: 0 8px 24px rgba(0,0,0,.28); backdrop-filter: blur(10px); }
 .screen-blank-chip svg { width: .88rem; }
 .screen-blank-chip small { margin-left: .1rem; color: white; font-size: .62rem; opacity: .68; }
+.dictation-chip { position: absolute; z-index: 13; left: 50%; bottom: .8rem; display: flex; max-width: min(28rem,calc(100% - 8rem)); min-height: 2.15rem; transform: translateX(-50%); align-items: center; gap: .42rem; border: 1px solid rgba(93,130,255,.4); border-radius: 999px; background: rgba(8,11,17,.88); padding: .42rem .72rem; color: rgba(255,255,255,.88); font-size: .68rem; box-shadow: 0 8px 24px rgba(0,0,0,.3); backdrop-filter: blur(10px); }
+.dictation-chip svg { width: .88rem; flex: none; }
+.dictation-chip.is-recording, .dictation-chip.is-error { border-color: rgba(255,107,117,.55); color: #ff9aa1; }
+.dictation-chip.is-done { border-color: rgba(79,226,180,.45); color: #75f0c8; }
 .scroll-buttons { position: absolute; z-index: 11; right: .72rem; top: 50%; display: grid; gap: .4rem; transform: translateY(-50%); }
 .scroll-buttons.has-clicks { grid-template-columns: repeat(2,3rem); }
 .scroll-buttons button { display: grid; width: 3rem; height: 3rem; place-items: center; gap: 0; border: 1px solid rgba(255,255,255,.15); border-radius: .8rem; background: rgba(8,11,17,.78); color: rgba(255,255,255,.9); box-shadow: 0 8px 24px rgba(0,0,0,.28); backdrop-filter: blur(10px); touch-action: manipulation; }
 .scroll-buttons button.is-primary { border-color: rgba(93,130,255,.7); background: rgba(49,94,251,.82); }
+.scroll-buttons button.is-recording, .remote-toolbar .toolbar-button.is-recording { border-color: rgba(255,107,117,.72); background: rgba(192,45,58,.9); color: white; animation: recording-pulse 1.4s ease-in-out infinite; }
 .scroll-buttons button:active { transform: scale(.94); background: rgba(49,94,251,.9); }
 .scroll-buttons button:disabled { opacity: .35; }
 .scroll-buttons svg { width: 1.05rem; height: 1.05rem; }
@@ -196,7 +201,7 @@ button, input { font: inherit; }
 .loupe-crosshair::before { width: 2.75rem; height: 1px; }
 .loupe-crosshair::after { width: 1px; height: 2.75rem; }
 .loupe-crosshair svg { width: .9rem; opacity: .9; }
-.remote-toolbar { z-index: 10; display: grid; grid-template-columns: 1.08fr 1.08fr repeat(3,1fr); gap: .5rem; border-top: 1px solid rgba(255,255,255,.08); background: var(--remote-panel); padding: .58rem max(.58rem,env(safe-area-inset-right)) max(calc(.58rem + env(safe-area-inset-bottom)),.58rem) max(.58rem,env(safe-area-inset-left)); backdrop-filter: blur(18px); transition: transform .22s ease,opacity .18s ease; }
+.remote-toolbar { z-index: 10; display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: .42rem; border-top: 1px solid rgba(255,255,255,.08); background: var(--remote-panel); padding: .58rem max(.58rem,env(safe-area-inset-right)) max(calc(.58rem + env(safe-area-inset-bottom)),.58rem) max(.58rem,env(safe-area-inset-left)); backdrop-filter: blur(18px); transition: transform .22s ease,opacity .18s ease; }
 .remote-toolbar button { height: 3.2rem; min-width: 0; flex-direction: column; gap: .13rem; border-radius: .75rem; color: white; }
 .remote-toolbar button svg { width: 1.03rem; height: 1.03rem; }
 .remote-toolbar .shortcut-button { background: #315efb; box-shadow: inset 0 1px rgba(255,255,255,.18); }
@@ -296,6 +301,9 @@ button, input { font: inherit; }
 .qr-placeholder span { max-width: 130px; font-size: .7rem; line-height: 1.45; }
 .host-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
 .host-settings-card { min-width: 0; border: 1px solid #dfe3e9; border-radius: 1rem; background: white; padding: 1.15rem; }
+.host-wide-card { grid-column: 1 / -1; }
+.secret-setting { display: grid; grid-template-columns: minmax(0,1fr) auto auto; gap: .5rem; }
+.secret-setting svg { width: 1rem; }
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: .15rem .15rem .9rem; }
 .section-heading h2 { margin: 0; font-size: .86rem; }
 .section-heading p { margin: .2rem 0 0; color: #7e8793; font-size: .66rem; }
@@ -320,6 +328,7 @@ button, input { font: inherit; }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes hint-away { to { opacity: 0; visibility: hidden; } }
+@keyframes recording-pulse { 50% { box-shadow: 0 0 0 5px rgba(225,77,85,.16),0 8px 24px rgba(0,0,0,.3); } }
 
 @media (max-width: 1023px) {
   .device-stage { min-height: 360px; max-width: 630px; margin: 0 auto; width: 100%; }
@@ -344,6 +353,9 @@ button, input { font: inherit; }
   .native-keyboard-capture { grid-template-columns: minmax(0,1fr) auto auto; gap: .3rem; }
   .native-keyboard-capture > svg { display: none; }
   .native-keyboard-special { padding: 0 .5rem; }
+  .remote-toolbar { gap: .25rem; padding-right: max(.35rem,env(safe-area-inset-right)); padding-left: max(.35rem,env(safe-area-inset-left)); }
+  .remote-toolbar button { padding-right: .2rem; padding-left: .2rem; }
+  .dictation-chip { max-width: calc(100% - 7rem); }
 }
 @media (orientation: landscape) and (max-height: 500px) {
   .remote-topbar { position: absolute; top: 0; left: 0; right: 0; min-height: 2.8rem; padding-top: .35rem; padding-bottom: .35rem; background: linear-gradient(#080b11df,transparent); border: 0; }
