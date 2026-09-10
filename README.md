@@ -50,6 +50,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
 - **Turn local screens off** covers every Windows display with a capture-excluded black privacy curtain. The phone continues showing and controlling the desktop underneath. Restore the displays from the phone, the companion, the tray, or with **Ctrl+Alt+Shift+F12**.
 - A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active code across a page reload. Disconnecting manually disables auto-reconnect.
+- Screen capture has its own recovery path: the phone reports the companion's capture status, retries stalled video automatically, and provides a **Retry screen** button without disconnecting mouse or keyboard control.
 
 ## Security and network notes
 

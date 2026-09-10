@@ -176,10 +176,12 @@ export function RemoteController() {
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
   const [screenBlanked, setScreenBlanked] = useState(false);
   const [displayControlSupported, setDisplayControlSupported] = useState(false);
+  const [hostNotice, setHostNotice] = useState('');
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scannerStatus, setScannerStatus] = useState('Starting camera…');
   const connectionRef = useRef<DataConnection | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
   const lastPongRef = useRef(0);
   const scannerVideoRef = useRef<HTMLVideoElement>(null);
   const scannerRef = useRef<QrScanner | null>(null);
@@ -264,13 +266,17 @@ export function RemoteController() {
     let disposed = false;
     let attempt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
+    let mediaRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let peer = newPeer();
     let connection: DataConnection | null = null;
 
     const cleanTransport = () => {
       connection?.close();
-      callRef.current?.close();
+      const activeCall = callRef.current;
       callRef.current = null;
+      activeCall?.close();
+      streamRef.current = null;
+      setStream(null);
       connectionRef.current = null;
       if (!peer.destroyed) peer.destroy();
     };
@@ -278,6 +284,8 @@ export function RemoteController() {
     const scheduleReconnect = () => {
       if (disposed || retryTimer) return;
       setConnectionState(navigator.onLine ? 'reconnecting' : 'offline');
+      setHostNotice(navigator.onLine ? 'Control connection lost. Reconnecting…' : 'Phone is offline.');
+      streamRef.current = null;
       setStream(null);
       const delay = navigator.onLine ? Math.min(1000 * 2 ** attempt, 8000) : 2500;
       attempt += 1;
@@ -309,8 +317,16 @@ export function RemoteController() {
           setRetryCount(0);
           lastPongRef.current = Date.now();
           setConnectionState('connected');
+          setHostNotice('Connected. Waiting for desktop video…');
           window.localStorage.setItem('compctrl.lastCode', sessionCode);
           window.localStorage.setItem('compctrl.autoReconnect', 'true');
+          if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
+          mediaRetryTimer = setTimeout(() => {
+            if (!disposed && connectionRef.current?.open && !callRef.current) {
+              setHostNotice('Requesting the desktop video again…');
+              send({ type: 'stream', action: 'request' });
+            }
+          }, 4500);
         });
         connection.on('data', (data) => {
           const message = data as HostMessage;
@@ -320,6 +336,7 @@ export function RemoteController() {
             const supported = typeof message.screenBlanked === 'boolean';
             setDisplayControlSupported(supported);
             setScreenBlanked(supported && message.screenBlanked);
+            setHostNotice('Connected. Starting desktop video…');
           } else if (message.type === 'status') {
             setJigglerEnabled(message.jigglerEnabled);
             if (typeof message.screenBlanked === 'boolean') {
@@ -328,6 +345,8 @@ export function RemoteController() {
             }
           } else if (message.type === 'pong') {
             lastPongRef.current = Date.now();
+          } else if (message.type === 'notice') {
+            setHostNotice(message.message);
           }
         });
         connection.on('close', scheduleReconnect);
@@ -335,15 +354,45 @@ export function RemoteController() {
       });
 
       peer.on('call', (incomingCall) => {
-        callRef.current?.close();
+        const previousCall = callRef.current;
+        callRef.current = null;
+        previousCall?.close();
         callRef.current = incomingCall;
-        incomingCall.answer();
-        incomingCall.on('stream', (remoteStream) => setStream(remoteStream));
-        incomingCall.on('close', () => {
+        streamRef.current = null;
+        setStream(null);
+        if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
+        mediaRetryTimer = null;
+        setHostNotice('Receiving desktop video…');
+        const streamTimeout = window.setTimeout(() => {
+          if (callRef.current !== incomingCall || streamRef.current) return;
+          setHostNotice('Desktop video timed out. Retrying…');
+          incomingCall.close();
+        }, 12_000);
+        const recoverMedia = () => {
+          window.clearTimeout(streamTimeout);
+          if (callRef.current !== incomingCall) return;
+          callRef.current = null;
+          streamRef.current = null;
           setStream(null);
-          scheduleReconnect();
+          if (!disposed && connectionRef.current?.open) {
+            setHostNotice('Video connection interrupted. Requesting it again…');
+            if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
+            mediaRetryTimer = setTimeout(() => send({ type: 'stream', action: 'request' }), 900);
+          }
+        };
+        incomingCall.answer();
+        incomingCall.on('stream', (remoteStream) => {
+          window.clearTimeout(streamTimeout);
+          if (callRef.current !== incomingCall) {
+            remoteStream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+          streamRef.current = remoteStream;
+          setStream(remoteStream);
+          setHostNotice('');
         });
-        incomingCall.on('error', scheduleReconnect);
+        incomingCall.on('close', recoverMedia);
+        incomingCall.on('error', recoverMedia);
       });
 
       peer.on('disconnected', scheduleReconnect);
@@ -374,12 +423,13 @@ export function RemoteController() {
 
     const resumeWhenVisible = () => {
       if (document.visibilityState !== 'visible') return;
-      if (connectionRef.current?.open && callRef.current) {
+      if (connectionRef.current?.open) {
         if (retryTimer) clearTimeout(retryTimer);
         retryTimer = null;
         lastPongRef.current = Date.now();
         setConnectionState('connected');
         send({ type: 'ping', sentAt: Date.now() });
+        if (!callRef.current) send({ type: 'stream', action: 'request' });
         return;
       }
       reconnectWhenOnline();
@@ -392,6 +442,7 @@ export function RemoteController() {
       disposed = true;
       window.clearInterval(heartbeat);
       if (retryTimer) clearTimeout(retryTimer);
+      if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
       window.removeEventListener('online', reconnectWhenOnline);
       document.removeEventListener('visibilitychange', resumeWhenVisible);
       window.removeEventListener('pageshow', resumeWhenVisible);
@@ -443,6 +494,7 @@ export function RemoteController() {
         connectionState={connectionState}
         retryCount={retryCount}
         stream={stream}
+        hostNotice={hostNotice}
         jigglerEnabled={jigglerEnabled}
         setJigglerEnabled={(enabled) => {
           setJigglerEnabled(enabled);
@@ -585,6 +637,7 @@ type RemoteSurfaceProps = {
   connectionState: ConnectionState;
   retryCount: number;
   stream: MediaStream | null;
+  hostNotice: string;
   jigglerEnabled: boolean;
   setJigglerEnabled(enabled: boolean): void;
   screenBlanked: boolean;
@@ -601,6 +654,7 @@ function RemoteSurface({
   connectionState,
   retryCount,
   stream,
+  hostNotice,
   jigglerEnabled,
   setJigglerEnabled,
   screenBlanked,
@@ -1179,7 +1233,7 @@ function RemoteSurface({
           <span className="remote-empty">
             {connected ? <Monitor className="size-8" /> : <WifiOff className="size-8" />}
             <strong>{connected ? 'Starting live screen…' : 'Finding your computer…'}</strong>
-            <span>{connected ? 'The companion is preparing the display.' : 'We will reconnect automatically when it is available.'}</span>
+            <span>{connected ? hostNotice || 'The companion is preparing the display.' : 'We will reconnect automatically when it is available.'}</span>
             {!connected && <span className="retry-note"><RefreshCw /> Retrying automatically</span>}
           </span>
         )}
@@ -1196,6 +1250,11 @@ function RemoteSurface({
           </span>
         )}
         </button>
+        {connected && !stream && (
+          <button type="button" className="stream-retry-button" onClick={() => send({ type: 'stream', action: 'request' })}>
+            <RefreshCw /> Retry screen
+          </button>
+        )}
         {stream && view.scale > 1.01 && (
           <button
             type="button"

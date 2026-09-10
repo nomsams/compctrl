@@ -140,6 +140,15 @@ function runSystemAction(action) {
   child.unref();
 }
 
+function isTrustedRendererUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+  } catch {
+    return false;
+  }
+}
+
 function destroyPrivacyWindows() {
   for (const privacyWindow of privacyWindows.splice(0)) {
     if (!privacyWindow.isDestroyed()) privacyWindow.destroy();
@@ -349,13 +358,21 @@ if (!app.requestSingleInstanceLock()) {
 
     const appSession = session.defaultSession;
     appSession.setDisplayMediaRequestHandler(async (_request, callback) => {
-      const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
-      callback({ video: sources[0] });
+      try {
+        const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
+        callback(sources[0] ? { video: sources[0] } : null);
+      } catch (error) {
+        console.error('Could not enumerate desktop capture sources:', error);
+        callback(null);
+      }
     }, { useSystemPicker: false });
     appSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
       const requestingUrl = details.requestingUrl || '';
-      const trusted = requestingUrl.startsWith('http://localhost:') || requestingUrl.startsWith('http://127.0.0.1:');
-      callback(trusted && (permission === 'media' || permission === 'display-capture'));
+      callback(isTrustedRendererUrl(requestingUrl) && (permission === 'media' || permission === 'display-capture'));
+    });
+    appSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin, details) => {
+      const requestingUrl = details?.requestingUrl || requestingOrigin || details?.securityOrigin || '';
+      return isTrustedRendererUrl(requestingUrl) && (permission === 'media' || permission === 'display-capture');
     });
 
     createTray();

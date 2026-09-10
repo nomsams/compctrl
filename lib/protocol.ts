@@ -28,6 +28,7 @@ export type KeyMessage = {
 export type TextMessage = { type: 'text'; text: string };
 export type JigglerMessage = { type: 'jiggler'; enabled: boolean };
 export type DisplayMessage = { type: 'display'; blanked: boolean };
+export type StreamMessage = { type: 'stream'; action: 'request' };
 export type SystemMessage = {
   type: 'system';
   action: 'restart' | 'shutdown';
@@ -41,6 +42,7 @@ export type ControllerMessage =
   | TextMessage
   | JigglerMessage
   | DisplayMessage
+  | StreamMessage
   | SystemMessage
   | PingMessage;
 
@@ -88,7 +90,7 @@ export function peerIdForCode(code: string) {
 
 export function isControllerMessage(value: unknown): value is ControllerMessage {
   if (!value || typeof value !== 'object' || !('type' in value)) return false;
-  return ['pointer', 'wheel', 'key', 'text', 'jiggler', 'display', 'system', 'ping'].includes(
+  return ['pointer', 'wheel', 'key', 'text', 'jiggler', 'display', 'stream', 'system', 'ping'].includes(
     String((value as { type: unknown }).type),
   );
 }

@@ -69,6 +69,8 @@ export function HostController() {
   const callRef = useRef<MediaConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const peerRef = useRef<ReturnType<typeof newPeer> | null>(null);
+  const shareScreenRef = useRef<(() => Promise<void>) | null>(null);
+  const capturePendingRef = useRef(false);
 
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -102,6 +104,10 @@ export function HostController() {
       setScreenBlanked(blanked);
       setNotice(blanked ? 'Local screens are private' : 'Local screens restored');
       send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked });
+      return;
+    }
+    if (message.type === 'stream') {
+      await shareScreenRef.current?.();
       return;
     }
     if (message.type === 'system') {
@@ -149,6 +155,7 @@ export function HostController() {
     const returnToReady = () => {
       if (disposed) return;
       connectionRef.current = null;
+      shareScreenRef.current = null;
       stopStream();
       setControllerName('Phone');
       setHostState('ready');
@@ -156,7 +163,12 @@ export function HostController() {
     };
 
     const shareScreenWith = async (remoteId: string) => {
+      if (capturePendingRef.current || !connectionRef.current?.open) return;
+      capturePendingRef.current = true;
+      setNotice('Starting desktop capture…');
+      send({ type: 'notice', message: 'Starting desktop capture…' });
       try {
+        stopStream();
         const stream = await navigator.mediaDevices.getDisplayMedia({
           video: { frameRate: { ideal: 24, max: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
@@ -166,8 +178,10 @@ export function HostController() {
           return;
         }
         streamRef.current = stream;
+        setNotice('Desktop captured — connecting video…');
+        send({ type: 'notice', message: 'Desktop captured. Connecting video…' });
         stream.getVideoTracks()[0]?.addEventListener('ended', () => {
-          if (!disposed && connectionRef.current?.open) {
+          if (!disposed && streamRef.current === stream && connectionRef.current?.open) {
             send({ type: 'notice', message: 'Screen sharing stopped on the computer.' });
             setNotice('Screen sharing stopped');
           }
@@ -177,8 +191,11 @@ export function HostController() {
         call.on('close', stopStream);
         call.on('error', stopStream);
       } catch (error) {
-        setNotice(`Could not start screen sharing: ${error instanceof Error ? error.message : 'unknown error'}`);
-        send({ type: 'notice', message: 'The companion could not start screen sharing.' });
+        const detail = error instanceof Error ? error.message : 'unknown error';
+        setNotice(`Could not start screen sharing: ${detail}`);
+        send({ type: 'notice', message: `Screen capture failed: ${detail}` });
+      } finally {
+        capturePendingRef.current = false;
       }
     };
 
@@ -197,10 +214,13 @@ export function HostController() {
       stopStream();
       connectionRef.current = incoming;
       setControllerName(metadata.deviceName || 'Phone');
-      setHostState('connected');
-      setNotice('Phone connected');
+      setHostState('starting');
+      setNotice('Phone found — securing connection…');
 
       incoming.on('open', () => {
+        setHostState('connected');
+        setNotice('Phone connected — starting screen…');
+        shareScreenRef.current = () => shareScreenWith(incoming.peer);
         void incoming.send({ type: 'ready', computerName, jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current } satisfies HostMessage);
         void shareScreenWith(incoming.peer);
       });
@@ -234,6 +254,8 @@ export function HostController() {
 
     return () => {
       disposed = true;
+      shareScreenRef.current = null;
+      capturePendingRef.current = false;
       stopStream();
       connectionRef.current?.close();
       connectionRef.current = null;

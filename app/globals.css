@@ -164,6 +164,9 @@ button, input { font: inherit; }
 .remote-empty .retry-note { display: flex; align-items: center; gap: .35rem; margin-top: .25rem; color: rgba(255,255,255,.65); }
 .remote-empty .retry-note svg { width: .85rem; animation: spin 1s linear infinite; }
 .remote-empty button { margin-top: .4rem; border-color: rgba(255,255,255,.16); background: rgba(255,255,255,.06); color: white; }
+.stream-retry-button { position: absolute; z-index: 9; left: 50%; bottom: 3.3rem; display: flex; height: 2.45rem; transform: translateX(-50%); align-items: center; gap: .42rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(8,11,17,.82); padding: 0 .85rem; color: rgba(255,255,255,.88); font-size: .7rem; font-weight: 650; box-shadow: 0 8px 24px rgba(0,0,0,.28); backdrop-filter: blur(10px); }
+.stream-retry-button:active { transform: translateX(-50%) scale(.96); background: rgba(49,94,251,.9); }
+.stream-retry-button svg { width: .9rem; }
 .touch-hint { position: absolute; z-index: 5; left: 50%; bottom: .8rem; transform: translateX(-50%); width: max-content; max-width: 92%; padding: .42rem .7rem; border-radius: 999px; background: rgba(8,11,17,.68); color: rgba(255,255,255,.68); font-size: .66rem; pointer-events: none; backdrop-filter: blur(8px); animation: hint-away .4s 7s forwards; }
 .view-zoom-reset { position: absolute; z-index: 7; right: .75rem; top: .75rem; display: flex; height: 2.15rem; align-items: center; gap: .35rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(8,11,17,.78); padding: 0 .72rem; color: rgba(255,255,255,.88); font-size: .68rem; font-weight: 650; box-shadow: 0 8px 24px rgba(0,0,0,.25); backdrop-filter: blur(10px); }
 .view-zoom-reset svg { width: .85rem; }
