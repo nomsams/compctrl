@@ -27,6 +27,8 @@ declare global {
         screenBlanked: boolean;
         autoStart: boolean;
         groqKeyConfigured: boolean;
+        trustedPeerId: string;
+        trustedDevices: Array<{ id: string; name: string; createdAt: number; lastSeenAt: number }>;
         version: string;
       }>;
       saveSettings(settings: {
@@ -36,6 +38,16 @@ declare global {
       }): Promise<void>;
       setGroqApiKey(key: string): Promise<boolean>;
       transcribeAudio(chunks: string[], mimeType: string): Promise<string>;
+      issueTrustedDevice(deviceId: string, deviceName: string): Promise<{
+        deviceId: string;
+        hostId: string;
+        token: string;
+        devices: Array<{ id: string; name: string; createdAt: number; lastSeenAt: number }>;
+      }>;
+      verifyTrustedDevice(deviceId: string, challenge: string, nonce: string, proof: string): Promise<boolean>;
+      revokeTrustedDevice(deviceId: string): Promise<Array<{ id: string; name: string; createdAt: number; lastSeenAt: number }>>;
+      readClipboard(): Promise<string>;
+      writeClipboard(text: string): Promise<void>;
       dispatch(message: import('@/lib/protocol').ControllerMessage): Promise<void>;
       setJiggler(enabled: boolean): Promise<void>;
       setDisplayBlanked(enabled: boolean): Promise<boolean>;

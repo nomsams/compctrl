@@ -36,6 +36,7 @@ import {
   cleanCode,
   createPairingCode,
   createSecurityToken,
+  isCompatibleProtocol,
   isControllerMessage,
   peerIdForCode,
 } from '@/lib/protocol';
@@ -60,6 +61,8 @@ export function HostController() {
   const [hostState, setHostState] = useState<HostState>('starting');
   const [pairingCode, setPairingCode] = useState('');
   const [hostPeerId, setHostPeerId] = useState('');
+  const [trustedPeerId, setTrustedPeerId] = useState('');
+  const [trustedDevices, setTrustedDevices] = useState<Array<{ id: string; name: string; createdAt: number; lastSeenAt: number }>>([]);
   const [computerName, setComputerName] = useState('Windows PC');
   const [controllerUrl, setControllerUrl] = useState('');
   const [urlDraft, setUrlDraft] = useState('');
@@ -79,8 +82,11 @@ export function HostController() {
   const callRef = useRef<MediaConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const peerRef = useRef<ReturnType<typeof newPeer> | null>(null);
+  const trustedPeerRef = useRef<ReturnType<typeof newPeer> | null>(null);
   const shareScreenRef = useRef<(() => Promise<void>) | null>(null);
   const capturePendingRef = useRef(false);
+  const requestedSystemAudioRef = useRef(false);
+  const connectedDeviceIdRef = useRef('');
 
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -180,7 +186,26 @@ export function HostController() {
       return;
     }
     if (message.type === 'stream') {
+      if (typeof message.systemAudio === 'boolean') requestedSystemAudioRef.current = message.systemAudio;
       await shareScreenRef.current?.();
+      return;
+    }
+    if (message.type === 'clipboard-read') {
+      try {
+        const text = await api.readClipboard();
+        send({ type: 'clipboard-result', requestId: message.requestId, action: 'read', ok: true, text, message: text ? 'Computer clipboard received.' : 'The computer clipboard is empty.' });
+      } catch {
+        send({ type: 'clipboard-result', requestId: message.requestId, action: 'read', ok: false, message: 'Could not read the computer clipboard.' });
+      }
+      return;
+    }
+    if (message.type === 'clipboard-write') {
+      try {
+        await api.writeClipboard(message.text);
+        send({ type: 'clipboard-result', requestId: message.requestId, action: 'write', ok: true, message: 'Phone text copied to the computer clipboard.' });
+      } catch {
+        send({ type: 'clipboard-result', requestId: message.requestId, action: 'write', ok: false, message: 'Could not update the computer clipboard.' });
+      }
       return;
     }
     if (message.type === 'system') {
@@ -205,6 +230,8 @@ export function HostController() {
       setScreenBlanked(settings.screenBlanked);
       setAutoStart(settings.autoStart);
       setGroqKeyConfigured(settings.groqKeyConfigured);
+      setTrustedPeerId(settings.trustedPeerId);
+      setTrustedDevices(settings.trustedDevices);
       void api.saveSettings({ pairingCode: code });
     });
     return () => { disposed = true; };
@@ -220,17 +247,19 @@ export function HostController() {
   }, [api, send]);
 
   useEffect(() => {
-    if (!api || !pairingCode || !hostPeerId) return;
+    if (!api || !pairingCode || !hostPeerId || !trustedPeerId) return;
     let disposed = false;
-    const peer = newPeer(hostPeerId);
+    let pairingPeer: ReturnType<typeof newPeer> | null = null;
+    let trustedPeer: ReturnType<typeof newPeer> | null = null;
     const pendingConnections = new Set<DataConnection>();
-    peerRef.current = peer;
     setHostState('starting');
-    setNotice('Opening P2P rendezvous…');
+    setNotice('Opening secure P2P rendezvous…');
 
     const returnToReady = (closedConnection?: DataConnection) => {
       if (disposed || (closedConnection && connectionRef.current !== closedConnection)) return;
       connectionRef.current = null;
+      connectedDeviceIdRef.current = '';
+      requestedSystemAudioRef.current = false;
       shareScreenRef.current = null;
       stopStream();
       setControllerName('Phone');
@@ -238,31 +267,38 @@ export function HostController() {
       setNotice('Waiting for your phone');
     };
 
-    const shareScreenWith = async (remoteId: string) => {
+    const shareScreenWith = async (remoteId: string, sourcePeer: ReturnType<typeof newPeer>, controllerProtocol: number) => {
       if (capturePendingRef.current || !connectionRef.current?.open) return;
       capturePendingRef.current = true;
-      setNotice('Starting desktop capture…');
-      send({ type: 'notice', message: 'Starting desktop capture…' });
+      const withAudio = requestedSystemAudioRef.current;
+      setNotice(withAudio ? 'Starting desktop capture with system audio…' : 'Starting desktop capture…');
+      send({ type: 'notice', message: withAudio ? 'Starting desktop capture with system audio…' : 'Starting desktop capture…' });
       try {
         stopStream();
         const stream = await navigator.mediaDevices.getDisplayMedia({
           video: { frameRate: { ideal: 24, max: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
-          audio: false,
+          audio: withAudio,
         });
         if (disposed || !connectionRef.current?.open) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
+        const videoTrack = stream.getVideoTracks()[0];
+        if (!videoTrack || videoTrack.readyState !== 'live') {
+          stream.getTracks().forEach((track) => track.stop());
+          throw new Error('Windows returned no live desktop video track.');
+        }
+        videoTrack.contentHint = 'detail';
         streamRef.current = stream;
-        setNotice('Desktop captured — connecting video…');
-        send({ type: 'notice', message: 'Desktop captured. Connecting video…' });
-        stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        setNotice(`Desktop captured${stream.getAudioTracks().length ? ' with audio' : ''} — connecting…`);
+        send({ type: 'notice', message: `Desktop captured${stream.getAudioTracks().length ? ' with system audio' : ''}. Connecting…` });
+        videoTrack.addEventListener('ended', () => {
           if (!disposed && streamRef.current === stream && connectionRef.current?.open) {
             send({ type: 'notice', message: 'Screen sharing stopped on the computer.' });
             setNotice('Screen sharing stopped');
           }
         });
-        const call = peer.call(remoteId, stream, { metadata: { protocol: PROTOCOL_VERSION } });
+        const call = sourcePeer.call(remoteId, stream, { metadata: { protocol: controllerProtocol, systemAudio: stream.getAudioTracks().length > 0 } });
         callRef.current = call;
         const finishCall = () => {
           if (callRef.current !== call) return;
@@ -283,134 +319,207 @@ export function HostController() {
       }
     };
 
-    peer.on('open', () => {
-      setHostState('ready');
-      setNotice('Waiting for your phone');
-    });
-
-    peer.on('connection', (incoming) => {
-      const metadata = incoming.metadata as { role?: string; protocol?: number; deviceName?: string } | undefined;
-      if (metadata?.role !== 'controller' || metadata.protocol !== PROTOCOL_VERSION || pendingConnections.size >= 3) {
-        incoming.close();
-        return;
-      }
-      pendingConnections.add(incoming);
-      let authenticated = false;
-      let authenticating = false;
-      let challenge = '';
-      let messageWindowStarted = Date.now();
-      let messagesInWindow = 0;
-      const authDeadline = window.setTimeout(() => incoming.close(), 8_000);
-
-      incoming.on('open', () => {
-        challenge = createSecurityToken();
-        setNotice('Phone found — verifying pairing secret…');
-        void incoming.send({ type: 'auth-challenge', challenge } satisfies HostMessage);
-      });
-      incoming.on('data', (data) => {
-        if (!isControllerMessage(data)) {
+    const acceptConnections = (sourcePeer: ReturnType<typeof newPeer>, mode: 'code' | 'trusted') => {
+      sourcePeer.on('connection', (incoming) => {
+        const metadata = incoming.metadata as {
+          role?: string;
+          protocol?: number;
+          deviceName?: string;
+          deviceId?: string;
+          authMode?: 'code' | 'trusted';
+        } | undefined;
+        const controllerProtocol = Number(metadata?.protocol);
+        const modernDevice = metadata?.authMode === mode
+          && typeof metadata.deviceId === 'string'
+          && /^[A-Za-z0-9_-]{16,128}$/.test(metadata.deviceId);
+        const legacyCodeController = mode === 'code' && controllerProtocol === 2
+          && metadata?.authMode === undefined && metadata?.deviceId === undefined;
+        if (
+          metadata?.role !== 'controller' || !isCompatibleProtocol(controllerProtocol)
+          || (mode === 'trusted' && controllerProtocol !== PROTOCOL_VERSION)
+          || (!modernDevice && !legacyCodeController) || pendingConnections.size >= 6
+        ) {
           incoming.close();
           return;
         }
-        if (!authenticated) {
-          if (authenticating || data.type !== 'auth-response' || data.challenge !== challenge) {
+        pendingConnections.add(incoming);
+        let authenticated = false;
+        let authenticating = false;
+        let challenge = '';
+        let messageWindowStarted = Date.now();
+        let messagesInWindow = 0;
+        const authDeadline = window.setTimeout(() => incoming.close(), 8_000);
+
+        incoming.on('open', () => {
+          challenge = createSecurityToken();
+          setNotice(mode === 'trusted' ? 'Recognized phone found — verifying its device key…' : 'Phone found — verifying pairing secret…');
+          void incoming.send({ type: 'auth-challenge', challenge } satisfies HostMessage);
+        });
+        incoming.on('data', (data) => {
+          if (!isControllerMessage(data)) {
             incoming.close();
             return;
           }
-          authenticating = true;
-          void authProofForCode(pairingCode, challenge, data.nonce).then((expectedProof) => {
-            if (disposed || data.proof !== expectedProof) {
+          if (!authenticated) {
+            if (
+              authenticating || data.type !== 'auth-response' || data.challenge !== challenge
+              || (!legacyCodeController && (data.method !== mode || data.deviceId !== metadata.deviceId))
+            ) {
               incoming.close();
               return;
             }
-            authenticated = true;
-            window.clearTimeout(authDeadline);
-            pendingConnections.delete(incoming);
-            const previous = connectionRef.current;
-            connectionRef.current = incoming;
-            previous?.close();
-            stopStream();
-            const safeName = typeof metadata.deviceName === 'string'
-              ? metadata.deviceName.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone'
-              : 'Phone';
-            setControllerName(safeName);
-            setHostState('connected');
-            setNotice('Phone authenticated — starting screen…');
-            shareScreenRef.current = () => shareScreenWith(incoming.peer);
-            void incoming.send({ type: 'auth-ok' } satisfies HostMessage);
-            void incoming.send({
-              type: 'ready',
-              computerName,
-              jigglerEnabled: jigglerRef.current,
-              screenBlanked: screenBlankedRef.current,
-              dictationAvailable: groqKeyConfiguredRef.current,
-            } satisfies HostMessage);
-            // The authenticated controller requests capture after processing these
-            // ordered messages, so a media call cannot race ahead of auth-ok.
-          }).catch(() => incoming.close());
-          return;
-        }
-        if (connectionRef.current !== incoming) {
-          incoming.close();
-          return;
-        }
-        const now = Date.now();
-        if (now - messageWindowStarted >= 1_000) {
-          messageWindowStarted = now;
-          messagesInWindow = 0;
-        }
-        messagesInWindow += 1;
-        if (messagesInWindow > 400) {
-          setNotice('Disconnected a controller that exceeded the safety rate limit.');
-          incoming.close();
-          return;
-        }
-        if (data.type !== 'auth-response') void handleControllerMessage(data);
-      });
-      incoming.on('close', () => {
-        window.clearTimeout(authDeadline);
-        pendingConnections.delete(incoming);
-        returnToReady(incoming);
-      });
-      incoming.on('error', () => {
-        window.clearTimeout(authDeadline);
-        pendingConnections.delete(incoming);
-        returnToReady(incoming);
-      });
-    });
+            authenticating = true;
+            void (async () => {
+              const authenticatedDeviceId = typeof data.deviceId === 'string' ? data.deviceId : '';
+              const valid = mode === 'trusted'
+                ? Boolean(authenticatedDeviceId) && await api.verifyTrustedDevice(authenticatedDeviceId, challenge, data.nonce, data.proof)
+                : data.proof === await authProofForCode(pairingCode, challenge, data.nonce);
+              if (disposed || !valid) {
+                void incoming.send({
+                  type: 'auth-rejected',
+                  reason: mode === 'trusted' ? 'trusted-device-revoked' : 'authentication-failed',
+                } satisfies HostMessage);
+                window.setTimeout(() => incoming.close(), 120);
+                return;
+              }
+              if (mode === 'trusted') {
+                const freshSettings = await api.getSettings();
+                if (!disposed) setTrustedDevices(freshSettings.trustedDevices);
+              }
 
-    peer.on('disconnected', () => {
+              authenticated = true;
+              window.clearTimeout(authDeadline);
+              pendingConnections.delete(incoming);
+              const previous = connectionRef.current;
+              connectionRef.current = incoming;
+              connectedDeviceIdRef.current = modernDevice ? authenticatedDeviceId : '';
+              previous?.close();
+              stopStream();
+              requestedSystemAudioRef.current = false;
+              const safeName = typeof metadata.deviceName === 'string'
+                ? metadata.deviceName.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone'
+                : 'Phone';
+              setControllerName(safeName);
+              setHostState('connected');
+              setNotice('Phone authenticated — starting screen…');
+              shareScreenRef.current = () => shareScreenWith(incoming.peer, sourcePeer, controllerProtocol);
+              void incoming.send({ type: 'auth-ok' } satisfies HostMessage);
+              if (mode === 'code' && modernDevice && data.deviceId) {
+                try {
+                  const credential = await api.issueTrustedDevice(data.deviceId, safeName);
+                  if (disposed || connectionRef.current !== incoming) return;
+                  setTrustedDevices(credential.devices);
+                  void incoming.send({
+                    type: 'trusted-credential',
+                    deviceId: credential.deviceId,
+                    hostId: credential.hostId,
+                    token: credential.token,
+                  } satisfies HostMessage);
+                } catch {
+                  void incoming.send({ type: 'notice', message: 'Connected, but this phone could not be saved as a trusted device.' } satisfies HostMessage);
+                }
+              }
+              if (disposed || connectionRef.current !== incoming) return;
+              void incoming.send({
+                type: 'ready',
+                computerName,
+                jigglerEnabled: jigglerRef.current,
+                screenBlanked: screenBlankedRef.current,
+                dictationAvailable: groqKeyConfiguredRef.current,
+                protocolVersion: PROTOCOL_VERSION,
+                capabilities: { trustedReconnect: true, clipboardText: true, systemAudio: true },
+              } satisfies HostMessage);
+            })().catch(() => incoming.close());
+            return;
+          }
+          if (connectionRef.current !== incoming) {
+            incoming.close();
+            return;
+          }
+          const now = Date.now();
+          if (now - messageWindowStarted >= 1_000) {
+            messageWindowStarted = now;
+            messagesInWindow = 0;
+          }
+          messagesInWindow += 1;
+          if (messagesInWindow > 400) {
+            setNotice('Disconnected a controller that exceeded the safety rate limit.');
+            incoming.close();
+            return;
+          }
+          if (data.type !== 'auth-response') void handleControllerMessage(data);
+        });
+        incoming.on('close', () => {
+          window.clearTimeout(authDeadline);
+          pendingConnections.delete(incoming);
+          returnToReady(incoming);
+        });
+        incoming.on('error', () => {
+          window.clearTimeout(authDeadline);
+          pendingConnections.delete(incoming);
+          returnToReady(incoming);
+        });
+      });
+
+      sourcePeer.on('open', () => {
+        if (disposed || connectionRef.current?.open) return;
+        setHostState('ready');
+        setNotice('Waiting for your phone');
+      });
+      sourcePeer.on('disconnected', () => {
+        if (disposed) return;
+        if (!connectionRef.current?.open) {
+          setHostState('reconnecting');
+          setNotice('Rendezvous interrupted — reconnecting…');
+        }
+        window.setTimeout(() => {
+          if (!disposed && sourcePeer.disconnected && !sourcePeer.destroyed) sourcePeer.reconnect();
+        }, 1200);
+      });
+      sourcePeer.on('error', (error) => {
+        if (disposed) return;
+        if (error.type === 'unavailable-id' && mode === 'code') {
+          const replacement = createPairingCode();
+          setPairingCode(replacement);
+          void api.saveSettings({ pairingCode: replacement });
+          return;
+        }
+        if (!connectionRef.current?.open) {
+          setHostState('error');
+          setNotice(mode === 'trusted' ? 'Trusted-device rendezvous failed. Restart the companion.' : 'Could not reach the P2P rendezvous. Retrying…');
+        }
+        window.setTimeout(() => {
+          if (!disposed && sourcePeer.disconnected && !sourcePeer.destroyed) sourcePeer.reconnect();
+        }, 3000);
+      });
+    };
+
+    // PeerJS releases an ID asynchronously. A short delay avoids racing the
+    // stable trusted-device ID when only the temporary pairing code changes.
+    const startupTimer = window.setTimeout(() => {
       if (disposed) return;
-      setHostState('reconnecting');
-      setNotice('Rendezvous interrupted — reconnecting…');
-      window.setTimeout(() => { if (!disposed && peer.disconnected && !peer.destroyed) peer.reconnect(); }, 1200);
-    });
-    peer.on('error', (error) => {
-      if (disposed) return;
-      if (error.type === 'unavailable-id') {
-        const replacement = createPairingCode();
-        setPairingCode(replacement);
-        void api.saveSettings({ pairingCode: replacement });
-        return;
-      }
-      setHostState('error');
-      setNotice('Could not reach the P2P rendezvous. Retrying…');
-      window.setTimeout(() => {
-        if (!disposed && peer.disconnected && !peer.destroyed) peer.reconnect();
-      }, 3000);
-    });
+      pairingPeer = newPeer(hostPeerId);
+      trustedPeer = newPeer(trustedPeerId);
+      peerRef.current = pairingPeer;
+      trustedPeerRef.current = trustedPeer;
+      acceptConnections(pairingPeer, 'code');
+      acceptConnections(trustedPeer, 'trusted');
+    }, 250);
 
     return () => {
       disposed = true;
+      window.clearTimeout(startupTimer);
       shareScreenRef.current = null;
       capturePendingRef.current = false;
       stopStream();
       connectionRef.current?.close();
       connectionRef.current = null;
-      if (!peer.destroyed) peer.destroy();
+      if (pairingPeer && !pairingPeer.destroyed) pairingPeer.destroy();
+      if (trustedPeer && !trustedPeer.destroyed) trustedPeer.destroy();
       peerRef.current = null;
+      trustedPeerRef.current = null;
     };
-  }, [api, computerName, handleControllerMessage, hostPeerId, pairingCode, send, stopStream]);
+  }, [api, computerName, handleControllerMessage, hostPeerId, pairingCode, send, stopStream, trustedPeerId]);
 
   const pairingUrl = useMemo(() => {
     const base = normalizeControllerUrl(controllerUrl);
@@ -422,6 +531,17 @@ export function HostController() {
     const code = createPairingCode();
     setPairingCode(code);
     void api.saveSettings({ pairingCode: code });
+  };
+
+  const revokeDevice = async (deviceId: string) => {
+    if (!api) return;
+    const devices = await api.revokeTrustedDevice(deviceId);
+    setTrustedDevices(devices);
+    const replacement = createPairingCode();
+    setPairingCode(replacement);
+    await api.saveSettings({ pairingCode: replacement });
+    if (connectedDeviceIdRef.current === deviceId) connectionRef.current?.close();
+    setNotice('Trusted phone revoked and the temporary pairing code was replaced');
   };
 
   const saveControllerUrl = () => {
@@ -561,6 +681,27 @@ export function HostController() {
               <Button onClick={saveControllerUrl}>Save</Button>
             </div>
             <p className="host-note"><CircleHelp /> Paste the address shown by GitHub Pages after publishing this project.</p>
+          </section>
+
+          <section className="host-settings-card host-wide-card">
+            <div className="section-heading"><div><h2>Trusted phones</h2><p>Paired phones reconnect with a separate encrypted device credential.</p></div><ShieldCheck /></div>
+            {trustedDevices.length ? (
+              <div className="trusted-device-list">
+                {trustedDevices.map((device) => (
+                  <div className="trusted-device-row" key={device.id}>
+                    <span className="host-setting-icon"><Smartphone /></span>
+                    <span>
+                      <strong>{device.name}</strong>
+                      <small>Last connected {new Date(device.lastSeenAt).toLocaleString()}</small>
+                    </span>
+                    <Button variant="outline" size="icon" onClick={() => void revokeDevice(device.id)} aria-label={`Revoke ${device.name}`}>
+                      <Trash2 />
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : <p className="trusted-empty">A phone appears here after its first successful code or QR connection.</p>}
+            <p className="host-note"><ShieldCheck /> Revoking a phone also replaces the temporary pairing code so that device cannot fall back to its old code.</p>
           </section>
 
           <section className="host-settings-card host-wide-card">

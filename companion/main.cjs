@@ -1,6 +1,7 @@
 const {
   app,
   BrowserWindow,
+  clipboard,
   Menu,
   Tray,
   desktopCapturer,
@@ -10,6 +11,7 @@ const {
   nativeImage,
   powerSaveBlocker,
   safeStorage,
+  screen,
   session,
   shell,
 } = require('electron');
@@ -20,6 +22,12 @@ const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 
+// Some Windows systems cannot start Electron's GPU subprocess (for example
+// after a graphics-driver update or on stripped-down/RDP sessions).  The host
+// UI and WebRTC desktop capture work with software rendering, so prefer the
+// reliable path instead of leaving the companion as a blank white window.
+app.disableHardwareAcceleration();
+
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 12;
 const JIGGLE_INTERVAL_MS = 30_000;
@@ -28,6 +36,8 @@ const GROQ_TRANSCRIPTION_URL = 'https://api.groq.com/openai/v1/audio/transcripti
 const GROQ_WHISPER_MODEL = 'whisper-large-v3-turbo';
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
 const MAX_NATIVE_QUEUE = 512;
+const MAX_CLIPBOARD_TEXT_LENGTH = 64 * 1024;
+const MAX_TRUSTED_DEVICES = 24;
 const DEFAULT_CONTROLLER_URL = 'https://nomsams.github.io/compctrl/';
 const isDevelopment = !app.isPackaged;
 
@@ -50,6 +60,34 @@ function generateCode() {
   return Array.from(crypto.randomBytes(CODE_LENGTH), (byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
 }
 
+function generateTrustedPeerId() {
+  return `compctrl-trusted-v1-${crypto.randomBytes(24).toString('base64url').slice(0, 32)}`;
+}
+
+function normalizeTrustedDevices(value) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, MAX_TRUSTED_DEVICES).flatMap((entry) => {
+    if (
+      !entry || typeof entry !== 'object'
+      || typeof entry.id !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(entry.id)
+      || typeof entry.tokenProtected !== 'string' || entry.tokenProtected.length > 1024
+    ) return [];
+    return [{
+      id: entry.id,
+      name: typeof entry.name === 'string' ? entry.name.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone' : 'Phone',
+      tokenProtected: entry.tokenProtected,
+      createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now(),
+      lastSeenAt: Number.isFinite(entry.lastSeenAt) ? entry.lastSeenAt : Date.now(),
+    }];
+  });
+}
+
+function trustedDeviceSummaries() {
+  return [...(settings?.trustedDevices ?? [])]
+    .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
+    .map(({ id, name, createdAt, lastSeenAt }) => ({ id, name, createdAt, lastSeenAt }));
+}
+
 function settingsPath() {
   return path.join(app.getPath('userData'), 'settings.json');
 }
@@ -61,6 +99,8 @@ function defaultSettings() {
     jigglerEnabled: false,
     autoStart: true,
     groqApiKeyProtected: '',
+    trustedPeerId: generateTrustedPeerId(),
+    trustedDevices: [],
   };
 }
 
@@ -78,6 +118,10 @@ function readSettings() {
       jigglerEnabled: stored.jigglerEnabled === true,
       autoStart: stored.autoStart !== false,
       groqApiKeyProtected: typeof stored.groqApiKeyProtected === 'string' ? stored.groqApiKeyProtected : '',
+      trustedPeerId: typeof stored.trustedPeerId === 'string' && /^compctrl-trusted-v1-[A-Za-z0-9_-]{32}$/.test(stored.trustedPeerId)
+        ? stored.trustedPeerId
+        : defaults.trustedPeerId,
+      trustedDevices: normalizeTrustedDevices(stored.trustedDevices),
     };
   } catch {
     return defaultSettings();
@@ -119,6 +163,66 @@ function readGroqApiKey() {
   } catch {
     throw new Error('The saved Groq API key could not be unlocked by this Windows account. Save it again.');
   }
+}
+
+function issueTrustedDevice(deviceId, deviceName) {
+  if (typeof deviceId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)) {
+    throw new Error('The controller supplied an invalid device identity.');
+  }
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Windows credential encryption is unavailable, so trusted reconnect cannot be enabled.');
+  }
+  const now = Date.now();
+  const name = typeof deviceName === 'string'
+    ? deviceName.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone'
+    : 'Phone';
+  const token = crypto.randomBytes(32).toString('base64url');
+  const existing = settings.trustedDevices.find((device) => device.id === deviceId);
+  const nextDevice = {
+    id: deviceId,
+    name,
+    tokenProtected: safeStorage.encryptString(token).toString('base64'),
+    createdAt: existing?.createdAt ?? now,
+    lastSeenAt: now,
+  };
+  settings.trustedDevices = [
+    nextDevice,
+    ...settings.trustedDevices.filter((device) => device.id !== deviceId),
+  ].slice(0, MAX_TRUSTED_DEVICES);
+  writeSettings(settings);
+  return { deviceId, hostId: settings.trustedPeerId, token, devices: trustedDeviceSummaries() };
+}
+
+function verifyTrustedDevice(deviceId, challenge, nonce, proof) {
+  if (
+    typeof deviceId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)
+    || typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(challenge)
+    || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)
+    || typeof proof !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(proof)
+  ) return false;
+  const device = settings.trustedDevices.find((candidate) => candidate.id === deviceId);
+  if (!device || !safeStorage.isEncryptionAvailable()) return false;
+  try {
+    const token = safeStorage.decryptString(Buffer.from(device.tokenProtected, 'base64'));
+    const expected = crypto.createHmac('sha256', token)
+      .update(`compctrl-trusted-v1:${challenge}:${nonce}`)
+      .digest('base64url');
+    const expectedBuffer = Buffer.from(expected);
+    const actualBuffer = Buffer.from(proof);
+    if (expectedBuffer.length !== actualBuffer.length || !crypto.timingSafeEqual(expectedBuffer, actualBuffer)) return false;
+    device.lastSeenAt = Date.now();
+    writeSettings(settings);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function revokeTrustedDevice(deviceId) {
+  if (typeof deviceId !== 'string') return trustedDeviceSummaries();
+  settings.trustedDevices = settings.trustedDevices.filter((device) => device.id !== deviceId);
+  writeSettings(settings);
+  return trustedDeviceSummaries();
 }
 
 function isNativeMessage(message) {
@@ -361,6 +465,8 @@ function registerIpc() {
       jigglerEnabled: settings.jigglerEnabled,
       autoStart: settings.autoStart,
       groqKeyConfigured: hasGroqApiKey(),
+      trustedPeerId: settings.trustedPeerId,
+      trustedDevices: trustedDeviceSummaries(),
       screenBlanked,
       computerName: os.hostname(),
       version: app.getVersion(),
@@ -422,6 +528,32 @@ function registerIpc() {
     assertTrustedIpc(event);
     return transcribeAudio(chunks, audioMimeType);
   });
+
+  ipcMain.handle('compctrl:issue-trusted-device', (event, deviceId, deviceName) => {
+    assertTrustedIpc(event);
+    return issueTrustedDevice(deviceId, deviceName);
+  });
+
+  ipcMain.handle('compctrl:verify-trusted-device', (event, deviceId, challenge, nonce, proof) => {
+    assertTrustedIpc(event);
+    return verifyTrustedDevice(deviceId, challenge, nonce, proof);
+  });
+
+  ipcMain.handle('compctrl:revoke-trusted-device', (event, deviceId) => {
+    assertTrustedIpc(event);
+    return revokeTrustedDevice(deviceId);
+  });
+
+  ipcMain.handle('compctrl:read-clipboard', (event) => {
+    assertTrustedIpc(event);
+    return clipboard.readText().slice(0, MAX_CLIPBOARD_TEXT_LENGTH);
+  });
+
+  ipcMain.handle('compctrl:write-clipboard', (event, value) => {
+    assertTrustedIpc(event);
+    if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_TEXT_LENGTH) throw new Error('Clipboard text is too large.');
+    clipboard.writeText(value);
+  });
 }
 
 function mimeType(filePath) {
@@ -431,6 +563,7 @@ function mimeType(filePath) {
     '.js': 'text/javascript; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
+    '.webmanifest': 'application/manifest+json; charset=utf-8',
     '.svg': 'image/svg+xml',
     '.png': 'image/png',
     '.ico': 'image/x-icon',
@@ -546,10 +679,16 @@ if (!app.requestSingleInstanceLock()) {
     configureAutoStart(settings.autoStart);
 
     const appSession = session.defaultSession;
-    appSession.setDisplayMediaRequestHandler(async (_request, callback) => {
+    appSession.setDisplayMediaRequestHandler(async (request, callback) => {
       try {
         const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
-        callback(sources[0] ? { video: sources[0] } : null);
+        const primaryDisplayId = String(screen.getPrimaryDisplay().id);
+        const source = sources.find((candidate) => String(candidate.display_id) === primaryDisplayId)
+          ?? sources.find((candidate) => Boolean(candidate.display_id))
+          ?? sources[0];
+        callback(source
+          ? { video: source, ...(request.audioRequested ? { audio: 'loopback' } : {}) }
+          : null);
       } catch (error) {
         console.error('Could not enumerate desktop capture sources:', error);
         callback(null);

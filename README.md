@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.2.1-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.3.1-x64.exe
 ```
 
 ## Controls
@@ -47,25 +47,31 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - Pinch with two fingers to zoom the live view up to 4×. The mapping remains aligned after phone orientation changes, and the visible zoom chip restores the full-screen view.
 - Use the fullscreen button for an immersive controller that hides both app bars. A small bottom button reveals the shortcut bar again, and the exit button restores the normal layout. Landscape mode also uses compact bars when not immersive.
 - **Scan QR code** opens the phone's rear camera and connects from the QR code displayed in the Windows companion.
-- Drag with two fingers to scroll.
+- Install the controller from the browser's **Install app** prompt to launch it as a standalone PWA without normal browser chrome. The app shell remains available offline so it can keep retrying when the network returns.
+- Tap with two fingers for a middle click. Swipe up or down with two fingers to scroll, and pinch to zoom.
 - Open session controls to switch between touchpad and direct-touch positioning, change pointer speed, disable tap-to-click, or enable drag/select. Drag/select is off by default to prevent accidental text selection.
 - Use the always-visible **Ctrl+C** and **Ctrl+V** buttons for clipboard shortcuts.
+- **Clipboard exchange** transfers text only when you explicitly press **Send to PC** or **Get from PC**. Clipboard images, files, and background monitoring are intentionally excluded.
+- The small **Apps** button opens Windows Task View for quick application switching.
 - **Type** opens the phone's native keyboard in a compact typing strip by default. Enable **Show full PC key panel** when you want the keyboard button to open function keys, modifiers, navigation keys, and arrows instead.
 - Use the dedicated **Up** and **Down** buttons on the edge of the desktop for reliable one-tap scrolling, or keep using the two-finger scroll gesture.
 - Fullscreen adds a dedicated **Enter** key beside left click, right click, and the two scroll buttons.
 - For voice dictation, create a key in the [Groq console](https://console.groq.com/keys), save it in the Windows companion, focus the desired text field on the remote computer, then tap **Voice** on the phone. Tap again to stop; the companion transcribes with `whisper-large-v3-turbo` and inserts the result at the focused Windows caret.
 - **Floating mini video** uses the phone browser's Picture-in-Picture mode when available, so the live computer view can stay above other apps. Return to the controller at any time; it resumes the existing session or reconnects automatically after mobile background suspension.
+- **Computer audio** can add Windows system sound to the P2P screen stream. It starts off for every new controller session and is enabled explicitly from session controls.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
 - **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
-- A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active code across a page reload. Disconnecting manually disables auto-reconnect.
+- The first successful code connection creates a high-entropy per-device credential. Trusted phones reconnect through a separate stable rendezvous identity; the companion lists every trusted phone and can revoke one at any time. Revocation also rotates the temporary pairing code.
+- A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active computer across a page reload. Disconnecting manually disables auto-reconnect without revoking the phone.
 - Screen capture has its own recovery path: the phone reports the companion's capture status, retries stalled video automatically, and provides a **Retry screen** button without disconnecting mouse or keyboard control.
+- Protocol 3 keeps screen/control compatibility with protocol 2 during staged upgrades. A new phone controller automatically retries the previous protocol, and a new companion accepts the previous published controller, preventing a cached or not-yet-deployed page from becoming a black screen.
 - If a browser or display driver leaves a live stream black or frozen, use **Session controls → Restart screen stream** to force a fresh desktop capture without re-pairing.
 
 ## Security and network notes
 
 - The Windows companion is required. Normal web pages are deliberately prevented from controlling the operating system or capturing the desktop unattended.
-- Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls.
-- The companion validates message shapes and sizes, rate-limits authenticated controllers, limits audio uploads and Groq calls, rejects navigation/downloads in its renderer, and accepts native IPC only from its private loopback page.
+- Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls. Trusted reconnect uses its own random 256-bit credential, encrypted at rest on Windows with `safeStorage`; only a revocable copy in that phone's browser storage can answer the trusted-device challenge.
+- The companion validates message shapes and sizes, caps clipboard text at 64 KiB, rate-limits authenticated controllers, limits audio uploads and Groq calls, rejects navigation/downloads in its renderer, and accepts native IPC only from its private loopback page.
 - WebRTC encrypts media and data in transit. The default public PeerJS signaling service can see connection metadata such as the temporary peer ID and IP addresses, but not decrypted screen or input data.
 - This build intentionally has no default TURN relay so the screen does not fall back to a third-party media server. A direct P2P route may fail on restrictive corporate, hotel, or carrier networks.
 - The native bridge accepts commands only through Electron IPC; it does not open a local TCP port. Restart and shutdown are unavailable until a paired WebRTC data channel is open, and the phone UI requires a press-and-hold confirmation.

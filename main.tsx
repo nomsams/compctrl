@@ -9,3 +9,10 @@ createRoot(document.getElementById('root')!).render(
     <Home />
   </StrictMode>,
 );
+
+if ('serviceWorker' in navigator && !window.compCtrl) {
+  window.addEventListener('load', () => {
+    const scopeUrl = new URL('./', document.baseURI);
+    void navigator.serviceWorker.register(new URL('sw.js', scopeUrl), { scope: scopeUrl.pathname });
+  });
+}

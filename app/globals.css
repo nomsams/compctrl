@@ -94,6 +94,9 @@ button, input { font: inherit; }
 }
 .eyebrow { color: var(--accent); background: rgba(49,94,251,.075); border-color: rgba(49,94,251,.12); text-transform: uppercase; letter-spacing: .11em; font-size: .68rem; }
 .status-dot { width: .46rem; height: .46rem; border-radius: 999px; background: #19c98e; box-shadow: 0 0 0 4px rgba(25,201,142,.12); }
+.pairing-header-actions { display: flex; align-items: center; gap: .55rem; }
+.install-app-button { min-height: 2.35rem; border-color: rgba(49,94,251,.2); border-radius: 999px; background: rgba(255,255,255,.75); color: var(--accent); font-size: .72rem; font-weight: 700; }
+.install-app-button svg { width: .9rem; }
 .pairing-field { display: flex; align-items: center; border: 1px solid #ccd2da; border-radius: 1rem; background: rgba(255,255,255,.82); box-shadow: 0 14px 40px rgba(40,48,66,.08), inset 0 1px white; transition: border-color .2s, box-shadow .2s; }
 .pairing-field:focus-within { border-color: rgba(49,94,251,.65); box-shadow: 0 0 0 4px rgba(49,94,251,.09), 0 14px 40px rgba(40,48,66,.08); }
 .pairing-secondary { display: flex; align-items: center; gap: .8rem; margin-top: .75rem; }
@@ -173,6 +176,11 @@ button, input { font: inherit; }
 .screen-blank-chip { position: absolute; z-index: 12; left: .75rem; top: .75rem; display: flex; height: 2.15rem; align-items: center; gap: .4rem; border: 1px solid rgba(79,226,180,.35); border-radius: 999px; background: rgba(7,34,28,.88); padding: 0 .7rem; color: #75f0c8; font-size: .68rem; font-weight: 650; box-shadow: 0 8px 24px rgba(0,0,0,.28); backdrop-filter: blur(10px); }
 .screen-blank-chip svg { width: .88rem; }
 .screen-blank-chip small { margin-left: .1rem; color: white; font-size: .62rem; opacity: .68; }
+.app-switcher-button { position: absolute; z-index: 12; left: .75rem; top: .75rem; display: flex; height: 2.15rem; align-items: center; gap: .35rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(8,11,17,.78); padding: 0 .68rem; color: rgba(255,255,255,.86); font-size: .62rem; font-weight: 700; box-shadow: 0 8px 24px rgba(0,0,0,.25); backdrop-filter: blur(10px); touch-action: manipulation; }
+.app-switcher-button.is-lowered { top: 3.4rem; }
+.app-switcher-button:active { transform: scale(.95); background: rgba(49,94,251,.9); }
+.app-switcher-button:disabled { opacity: .35; }
+.app-switcher-button svg { width: .88rem; }
 .dictation-chip { position: absolute; z-index: 13; left: 50%; bottom: .8rem; display: flex; max-width: min(28rem,calc(100% - 8rem)); min-height: 2.15rem; transform: translateX(-50%); align-items: center; gap: .42rem; border: 1px solid rgba(93,130,255,.4); border-radius: 999px; background: rgba(8,11,17,.88); padding: .42rem .72rem; color: rgba(255,255,255,.88); font-size: .68rem; box-shadow: 0 8px 24px rgba(0,0,0,.3); backdrop-filter: blur(10px); }
 .dictation-chip svg { width: .88rem; flex: none; }
 .dictation-chip.is-recording, .dictation-chip.is-error { border-color: rgba(255,107,117,.55); color: #ff9aa1; }
@@ -228,7 +236,7 @@ button, input { font: inherit; }
 .native-keyboard-close svg { width: .95rem; }
 .remote-shell.is-immersive.controls-hidden .native-keyboard-capture { bottom: max(.65rem,env(safe-area-inset-bottom)); }
 .remote-shell.has-native-keyboard { top: var(--controller-visual-top,0); bottom: auto; height: var(--controller-visual-height,100dvh); grid-template-rows: minmax(0,1fr) auto; }
-.remote-shell.has-native-keyboard .remote-topbar, .remote-shell.has-native-keyboard .remote-toolbar, .remote-shell.has-native-keyboard .scroll-buttons, .remote-shell.has-native-keyboard .immersive-exit, .remote-shell.has-native-keyboard .immersive-toolbar-toggle { display: none; }
+.remote-shell.has-native-keyboard .remote-topbar, .remote-shell.has-native-keyboard .remote-toolbar, .remote-shell.has-native-keyboard .scroll-buttons, .remote-shell.has-native-keyboard .app-switcher-button, .remote-shell.has-native-keyboard .immersive-exit, .remote-shell.has-native-keyboard .immersive-toolbar-toggle { display: none; }
 .remote-shell.has-native-keyboard .remote-stage-wrap { grid-row: 1; }
 .remote-shell.has-native-keyboard .native-keyboard-capture, .remote-shell.is-immersive.controls-hidden.has-native-keyboard .native-keyboard-capture { position: relative; right: auto; bottom: auto; left: auto; grid-row: 2; margin: .4rem max(.4rem,env(safe-area-inset-right)) max(.4rem,env(safe-area-inset-bottom)) max(.4rem,env(safe-area-inset-left)); transform: none; }
 .keyboard-drawer, .control-drawer { --drawer-inset: .5rem; border: 1px solid rgba(255,255,255,.1) !important; background: #171c27 !important; color: white !important; }
@@ -246,6 +254,14 @@ button, input { font: inherit; }
 .key-space { flex: 5; }
 .extra-keys { display: flex; min-width: 720px; gap: .34rem; margin-top: .65rem; }
 .extra-keys .pc-key { padding: 0 .65rem; }
+.clipboard-content { display: grid; gap: .75rem; width: min(100%,42rem); margin: 0 auto; padding: .3rem 1rem max(1rem,env(safe-area-inset-bottom)); }
+.clipboard-content textarea { min-height: 9rem; resize: vertical; border-color: rgba(255,255,255,.1); background: rgba(255,255,255,.065); color: white; font-family: var(--font-geist-mono); font-size: .78rem; }
+.clipboard-content textarea::placeholder { color: rgba(255,255,255,.32); }
+.clipboard-status { min-height: 1.2rem; color: rgba(255,255,255,.48); font-size: .68rem; line-height: 1.45; }
+.clipboard-actions { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: .5rem; }
+.clipboard-actions button { min-height: 2.75rem; border-color: rgba(255,255,255,.13); color: white; }
+.clipboard-actions button:not([data-variant='outline']) { background: #315efb; }
+.clipboard-actions button[data-variant='outline'] { background: rgba(255,255,255,.055); }
 .control-list { display: grid; gap: .4rem; overflow: auto; padding: 1rem; padding-bottom: max(1rem,env(safe-area-inset-bottom)); }
 .control-section-label { margin: .3rem .2rem .05rem; color: rgba(255,255,255,.38); font-size: .64rem; font-weight: 700; letter-spacing: .09em; text-transform: uppercase; }
 .control-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: .8rem; width: 100%; min-height: 4.3rem; border: 1px solid rgba(255,255,255,.08); border-radius: .85rem; background: rgba(255,255,255,.045); padding: .72rem; text-align: left; color: white; }
@@ -318,6 +334,14 @@ button, input { font: inherit; }
 .url-setting input { min-width: 0; flex: 1; }
 .host-note { display: flex; align-items: center; gap: .4rem; margin: .7rem .1rem 0; color: #89919d; font-size: .65rem; }
 .host-note svg { width: .85rem; flex: none; }
+.trusted-device-list { display: grid; gap: .45rem; }
+.trusted-device-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: .7rem; border-top: 1px solid #edf0f3; padding: .65rem .1rem; }
+.trusted-device-row strong, .trusted-device-row small { display: block; }
+.trusted-device-row strong { font-size: .75rem; }
+.trusted-device-row small { margin-top: .12rem; color: #87909b; font-size: .62rem; }
+.trusted-device-row button { width: 2.25rem; height: 2.25rem; color: #a33a43; }
+.trusted-device-row button svg { width: .9rem; }
+.trusted-empty { margin: .2rem 0 .5rem; border: 1px dashed #d9dee5; border-radius: .75rem; padding: 1rem; color: #7e8793; font-size: .7rem; text-align: center; }
 .host-activity { display: flex; align-items: center; gap: .8rem; margin-top: 1rem; border: 1px solid #dfe3e9; border-radius: .9rem; background: white; padding: .8rem 1rem; }
 .activity-icon { display: grid; width: 2.35rem; height: 2.35rem; flex: none; place-items: center; border-radius: .65rem; background: rgba(49,94,251,.07); color: #315efb; }
 .activity-icon svg { width: 1rem; }
@@ -340,6 +364,7 @@ button, input { font: inherit; }
 }
 @media (max-width: 540px) {
   .status-pill { font-size: 0; gap: 0; padding: .65rem; }
+  .install-app-button { padding: 0 .7rem; font-size: .67rem; }
   .device-stage { min-height: 290px; }
   .screen-card { transform: none; border-radius: 1.1rem; }
   .mock-desktop { min-height: 220px; grid-template-columns: 3.1rem 1fr; }
@@ -367,5 +392,7 @@ button, input { font: inherit; }
   .remote-toolbar button { height: 2.7rem; flex-direction: row; gap: .32rem; }
   .scroll-buttons { right: max(.55rem,env(safe-area-inset-right)); }
   .remote-shell.is-immersive .view-zoom-reset { top: max(.6rem,env(safe-area-inset-top)); right: max(3.75rem,calc(3.45rem + env(safe-area-inset-right))); }
+  .remote-shell:not(.is-immersive) .app-switcher-button { top: 3.15rem; }
+  .remote-shell:not(.is-immersive) .app-switcher-button.is-lowered { top: 5.8rem; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; } }

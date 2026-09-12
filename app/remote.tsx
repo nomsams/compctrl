@@ -8,6 +8,7 @@ import {
   CornerDownLeft,
   Crosshair,
   EyeOff,
+  Download,
   ChevronDown,
   ChevronUp,
   Gauge,
@@ -21,12 +22,14 @@ import {
   MicOff,
   MousePointer2,
   MousePointerClick,
+  PanelsTopLeft,
   PictureInPicture2,
   Power,
   RefreshCw,
   RotateCcw,
   ScanLine,
   ShieldCheck,
+  Volume2,
   Unplug,
   WifiOff,
   X,
@@ -67,6 +70,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
 import { newPeer } from '@/lib/peer';
 import {
   MAX_VIEW_SCALE,
@@ -82,13 +86,16 @@ import {
 } from '@/lib/remote-geometry';
 import {
   CODE_LENGTH,
+  MAX_CLIPBOARD_TEXT_LENGTH,
   type ConnectionState,
   type ControllerMessage,
   type HostMessage,
   PROTOCOL_VERSION,
   authProofForCode,
+  authProofForTrustedToken,
   cleanCode,
   createSecurityToken,
+  isCompatibleProtocol,
   isHostMessage,
   pairingCodeFromQr,
   peerIdForCode,
@@ -96,6 +103,14 @@ import {
 
 type Modifier = 'Control' | 'Alt' | 'Shift' | 'Meta';
 type DictationState = 'idle' | 'recording' | 'sending' | 'transcribing' | 'done' | 'error';
+type ClipboardResult = Extract<HostMessage, { type: 'clipboard-result' }>;
+type TrustedCredential = { version: 1; code: string; deviceId: string; hostId: string; token: string };
+type HostCapabilities = { trustedReconnect: boolean; clipboardText: boolean; systemAudio: boolean };
+
+type InstallPromptEvent = Event & {
+  prompt(): Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
+};
 
 function bytesToBase64(bytes: Uint8Array) {
   let binary = '';
@@ -165,6 +180,42 @@ function readInitialCode() {
   return cleanCode(window.localStorage.getItem('compctrl.lastCode') ?? '');
 }
 
+function getOrCreateDeviceId() {
+  if (typeof window === 'undefined') return '';
+  const stored = window.localStorage.getItem('compctrl.deviceId') ?? '';
+  if (/^[A-Za-z0-9_-]{16,128}$/.test(stored)) return stored;
+  const created = createSecurityToken(24);
+  window.localStorage.setItem('compctrl.deviceId', created);
+  return created;
+}
+
+function controllerDeviceName() {
+  const agent = navigator.userAgent;
+  if (/iPhone/i.test(agent)) return 'iPhone';
+  if (/iPad/i.test(agent)) return 'iPad';
+  if (/Android/i.test(agent)) return /Mobile/i.test(agent) ? 'Android phone' : 'Android tablet';
+  return 'Phone browser';
+}
+
+function trustedStorageKey(code: string) {
+  return `compctrl.trusted.${cleanCode(code)}`;
+}
+
+function readTrustedCredential(code: string): TrustedCredential | null {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(trustedStorageKey(code)) ?? 'null') as Partial<TrustedCredential> | null;
+    if (
+      value?.version !== 1 || value.code !== cleanCode(code)
+      || typeof value.deviceId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.deviceId)
+      || typeof value.hostId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.hostId)
+      || typeof value.token !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.token)
+    ) return null;
+    return value as TrustedCredential;
+  } catch {
+    return null;
+  }
+}
+
 function cameraErrorMessage(error: unknown) {
   const message = error instanceof Error ? `${error.name} ${error.message}` : String(error);
   if (/notallowed|permission|denied/i.test(message)) {
@@ -194,6 +245,11 @@ export function RemoteController() {
   const [dictationState, setDictationState] = useState<DictationState>('idle');
   const [dictationMessage, setDictationMessage] = useState('');
   const [hostNotice, setHostNotice] = useState('');
+  const [trustedDevice, setTrustedDevice] = useState(false);
+  const [clipboardResult, setClipboardResult] = useState<ClipboardResult | null>(null);
+  const [systemAudioEnabled, setSystemAudioEnabled] = useState(false);
+  const [hostCapabilities, setHostCapabilities] = useState<HostCapabilities>({ trustedReconnect: false, clipboardText: false, systemAudio: false });
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scannerStatus, setScannerStatus] = useState('Starting camera…');
   const connectionRef = useRef<DataConnection | null>(null);
@@ -207,6 +263,30 @@ export function RemoteController() {
   const dictationChunksRef = useRef<Blob[]>([]);
   const dictationIdRef = useRef('');
   const dictationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const deviceIdRef = useRef('');
+  const systemAudioEnabledRef = useRef(false);
+
+  useEffect(() => {
+    deviceIdRef.current = getOrCreateDeviceId();
+  }, []);
+
+  useEffect(() => {
+    systemAudioEnabledRef.current = systemAudioEnabled;
+  }, [systemAudioEnabled]);
+
+  useEffect(() => {
+    const captureInstallPrompt = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    const installed = () => setInstallPrompt(null);
+    window.addEventListener('beforeinstallprompt', captureInstallPrompt);
+    window.addEventListener('appinstalled', installed);
+    return () => {
+      window.removeEventListener('beforeinstallprompt', captureInstallPrompt);
+      window.removeEventListener('appinstalled', installed);
+    };
+  }, []);
 
   useEffect(() => {
     const initial = readInitialCode();
@@ -388,6 +468,12 @@ export function RemoteController() {
     let mediaRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let peer: ReturnType<typeof newPeer> | null = null;
     let connection: DataConnection | null = null;
+    let trustedCredential = readTrustedCredential(sessionCode);
+    if (trustedCredential && trustedCredential.deviceId !== deviceIdRef.current) {
+      window.localStorage.removeItem(trustedStorageKey(sessionCode));
+      trustedCredential = null;
+    }
+    setTrustedDevice(Boolean(trustedCredential));
 
     const cleanTransport = () => {
       const recorder = recorderRef.current;
@@ -399,6 +485,7 @@ export function RemoteController() {
       stopRecorderTracks();
       setDictationState('idle');
       setDictationAvailable(false);
+      setHostCapabilities({ trustedReconnect: false, clipboardText: false, systemAudio: false });
       connection?.close();
       const activeCall = callRef.current;
       callRef.current = null;
@@ -435,12 +522,22 @@ export function RemoteController() {
 
       activePeer.on('open', () => {
         if (disposed) return;
-        void peerIdForCode(sessionCode).then((hostId) => {
+        const credential = trustedCredential;
+        const authMode = credential ? 'trusted' as const : 'code' as const;
+        const connectionProtocol = credential ? PROTOCOL_VERSION : (attempt % 2 === 0 ? PROTOCOL_VERSION : 2);
+        const hostIdPromise = credential ? Promise.resolve(credential.hostId) : peerIdForCode(sessionCode);
+        void hostIdPromise.then((hostId) => {
           if (disposed || activePeer.destroyed) return;
           connection = activePeer.connect(hostId, {
             reliable: true,
             serialization: 'json',
-            metadata: { role: 'controller', protocol: PROTOCOL_VERSION },
+            metadata: {
+              role: 'controller',
+              protocol: connectionProtocol,
+              authMode,
+              deviceId: deviceIdRef.current,
+              deviceName: controllerDeviceName(),
+            },
           });
 
           connection.on('open', () => {
@@ -454,11 +551,31 @@ export function RemoteController() {
             const message: HostMessage = data;
             if (message.type === 'auth-challenge') {
               const nonce = createSecurityToken();
-              void authProofForCode(sessionCode, message.challenge, nonce).then((proof) => {
+              const proofPromise = credential
+                ? authProofForTrustedToken(credential.token, message.challenge, nonce)
+                : authProofForCode(sessionCode, message.challenge, nonce);
+              void proofPromise.then((proof) => {
                 if (!disposed && connection?.open) {
-                  void connection.send({ type: 'auth-response', challenge: message.challenge, nonce, proof } satisfies ControllerMessage);
+                  void connection.send({
+                    type: 'auth-response',
+                    method: authMode,
+                    challenge: message.challenge,
+                    nonce,
+                    proof,
+                    deviceId: deviceIdRef.current,
+                  } satisfies ControllerMessage);
                 }
               }).catch(scheduleReconnect);
+              return;
+            }
+            if (message.type === 'auth-rejected') {
+              if (authMode === 'trusted') {
+                window.localStorage.removeItem(trustedStorageKey(sessionCode));
+                trustedCredential = null;
+                setTrustedDevice(false);
+                setHostNotice('This phone is no longer trusted. Trying the current pairing code…');
+              }
+              connection?.close();
               return;
             }
             if (message.type === 'auth-ok') {
@@ -475,37 +592,55 @@ export function RemoteController() {
               mediaRetryTimer = setTimeout(() => {
                 if (!disposed && connectionRef.current?.open && !callRef.current) {
                   setHostNotice('Requesting the desktop video again…');
-                  send({ type: 'stream', action: 'request' });
+                  send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current });
                 }
               }, 4500);
               return;
             }
-          if (message.type === 'ready') {
-            setComputerName(message.computerName);
-            setJigglerEnabled(message.jigglerEnabled);
-            setDictationAvailable(message.dictationAvailable);
-            const supported = typeof message.screenBlanked === 'boolean';
-            setDisplayControlSupported(supported);
-            setScreenBlanked(supported && message.screenBlanked);
-            setHostNotice('Connected. Starting desktop video…');
-            if (!callRef.current) send({ type: 'stream', action: 'request' });
-          } else if (message.type === 'status') {
-            setJigglerEnabled(message.jigglerEnabled);
-            setDictationAvailable(message.dictationAvailable);
-            if (typeof message.screenBlanked === 'boolean') {
-              setDisplayControlSupported(true);
-              setScreenBlanked(message.screenBlanked);
+            if (message.type === 'trusted-credential') {
+              if (message.deviceId !== deviceIdRef.current) return;
+              trustedCredential = {
+                version: 1,
+                code: sessionCode,
+                deviceId: message.deviceId,
+                hostId: message.hostId,
+                token: message.token,
+              };
+              window.localStorage.setItem(trustedStorageKey(sessionCode), JSON.stringify(trustedCredential));
+              setTrustedDevice(true);
+              return;
             }
-          } else if (message.type === 'pong') {
-            lastPongRef.current = Date.now();
-          } else if (message.type === 'notice') {
-            setHostNotice(message.message);
-          } else if (message.type === 'dictation-status' && message.id === dictationIdRef.current) {
-            setDictationMessage(message.message);
-            if (message.status === 'transcribing') setDictationState('transcribing');
-            else if (message.status === 'done') setDictationState('done');
-            else if (message.status === 'error') setDictationState('error');
-          }
+            if (message.type === 'clipboard-result') {
+              setClipboardResult(message);
+              return;
+            }
+            if (message.type === 'ready') {
+              setComputerName(message.computerName);
+              setJigglerEnabled(message.jigglerEnabled);
+              setDictationAvailable(message.dictationAvailable);
+              const supported = typeof message.screenBlanked === 'boolean';
+              setDisplayControlSupported(supported);
+              setScreenBlanked(supported && message.screenBlanked);
+              setHostCapabilities(message.capabilities ?? { trustedReconnect: false, clipboardText: false, systemAudio: false });
+              setHostNotice('Connected. Starting desktop video…');
+              if (!callRef.current) send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current });
+            } else if (message.type === 'status') {
+              setJigglerEnabled(message.jigglerEnabled);
+              setDictationAvailable(message.dictationAvailable);
+              if (typeof message.screenBlanked === 'boolean') {
+                setDisplayControlSupported(true);
+                setScreenBlanked(message.screenBlanked);
+              }
+            } else if (message.type === 'pong') {
+              lastPongRef.current = Date.now();
+            } else if (message.type === 'notice') {
+              setHostNotice(message.message);
+            } else if (message.type === 'dictation-status' && message.id === dictationIdRef.current) {
+              setDictationMessage(message.message);
+              if (message.status === 'transcribing') setDictationState('transcribing');
+              else if (message.status === 'done') setDictationState('done');
+              else if (message.status === 'error') setDictationState('error');
+            }
           });
           connection.on('close', scheduleReconnect);
           connection.on('error', scheduleReconnect);
@@ -514,7 +649,7 @@ export function RemoteController() {
 
       activePeer.on('call', (incomingCall) => {
         const metadata = incomingCall.metadata as { protocol?: number } | undefined;
-        if (!connectionRef.current?.open || incomingCall.peer !== connectionRef.current.peer || metadata?.protocol !== PROTOCOL_VERSION) {
+        if (!connectionRef.current?.open || incomingCall.peer !== connectionRef.current.peer || !isCompatibleProtocol(metadata?.protocol)) {
           incomingCall.close();
           return;
         }
@@ -550,7 +685,7 @@ export function RemoteController() {
           if (!disposed && connectionRef.current?.open) {
             setHostNotice('Video connection interrupted. Requesting it again…');
             if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
-            mediaRetryTimer = setTimeout(() => send({ type: 'stream', action: 'request' }), 900);
+            mediaRetryTimer = setTimeout(() => send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current }), 900);
           }
         };
         incomingCall.answer();
@@ -613,7 +748,7 @@ export function RemoteController() {
         lastPongRef.current = Date.now();
         setConnectionState('connected');
         send({ type: 'ping', sentAt: Date.now() });
-        if (!callRef.current) send({ type: 'stream', action: 'request' });
+        if (!callRef.current) send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current });
         return;
       }
       reconnectWhenOnline();
@@ -636,6 +771,13 @@ export function RemoteController() {
   }, [reconnectNonce, send, sessionCode, stopRecorderTracks]);
 
   const startSession = () => { beginSession(code); };
+
+  const installController = async () => {
+    if (!installPrompt) return;
+    await installPrompt.prompt();
+    const choice = await installPrompt.userChoice;
+    if (choice.outcome === 'accepted') setInstallPrompt(null);
+  };
 
   useEffect(() => {
     const context = document.modelContext;
@@ -665,6 +807,8 @@ export function RemoteController() {
   const disconnect = () => {
     window.localStorage.removeItem('compctrl.autoReconnect');
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+    setSystemAudioEnabled(false);
+    systemAudioEnabledRef.current = false;
     setSessionCode(null);
     setStream(null);
     setConnectionState('idle');
@@ -679,6 +823,16 @@ export function RemoteController() {
         retryCount={retryCount}
         stream={stream}
         hostNotice={hostNotice}
+        trustedDevice={trustedDevice}
+        hostCapabilities={hostCapabilities}
+        clipboardResult={clipboardResult}
+        systemAudioEnabled={systemAudioEnabled}
+        setSystemAudioEnabled={(enabled) => {
+          if (!hostCapabilities.systemAudio) return;
+          setSystemAudioEnabled(enabled);
+          systemAudioEnabledRef.current = enabled;
+          send({ type: 'stream', action: 'request', systemAudio: enabled });
+        }}
         jigglerEnabled={jigglerEnabled}
         setJigglerEnabled={(enabled) => {
           setJigglerEnabled(enabled);
@@ -697,6 +851,11 @@ export function RemoteController() {
         }}
         send={send}
         disconnect={disconnect}
+        forgetTrustedDevice={() => {
+          window.localStorage.removeItem(trustedStorageKey(sessionCode));
+          setTrustedDevice(false);
+          disconnect();
+        }}
         reconnect={() => setReconnectNonce((value) => value + 1)}
       />
     );
@@ -710,7 +869,14 @@ export function RemoteController() {
           <span className="brand-mark"><MousePointer2 className="size-[18px]" strokeWidth={2.4} /></span>
           <span className="text-[0.95rem] font-semibold tracking-[-0.02em]">CompCtrl</span>
         </div>
-        <span className="status-pill"><span className="status-dot" /> End-to-end P2P</span>
+        <div className="pairing-header-actions">
+          {installPrompt && (
+            <Button type="button" variant="outline" className="install-app-button" onClick={() => void installController()}>
+              <Download /> Install app
+            </Button>
+          )}
+          <span className="status-pill"><span className="status-dot" /> End-to-end P2P</span>
+        </div>
       </header>
 
       <section className="relative z-10 mx-auto grid w-full max-w-6xl items-center gap-10 px-5 pb-10 pt-4 sm:px-8 lg:grid-cols-[0.86fr_1.14fr] lg:gap-16 lg:pt-12">
@@ -826,6 +992,11 @@ type RemoteSurfaceProps = {
   retryCount: number;
   stream: MediaStream | null;
   hostNotice: string;
+  trustedDevice: boolean;
+  hostCapabilities: HostCapabilities;
+  clipboardResult: ClipboardResult | null;
+  systemAudioEnabled: boolean;
+  setSystemAudioEnabled(enabled: boolean): void;
   jigglerEnabled: boolean;
   setJigglerEnabled(enabled: boolean): void;
   screenBlanked: boolean;
@@ -837,6 +1008,7 @@ type RemoteSurfaceProps = {
   setScreenBlanked(blanked: boolean): void;
   send(message: ControllerMessage): boolean;
   disconnect(): void;
+  forgetTrustedDevice(): void;
   reconnect(): void;
 };
 
@@ -847,6 +1019,11 @@ function RemoteSurface({
   retryCount,
   stream,
   hostNotice,
+  trustedDevice,
+  hostCapabilities,
+  clipboardResult,
+  systemAudioEnabled,
+  setSystemAudioEnabled,
   jigglerEnabled,
   setJigglerEnabled,
   screenBlanked,
@@ -858,15 +1035,18 @@ function RemoteSurface({
   setScreenBlanked,
   send,
   disconnect,
+  forgetTrustedDevice,
   reconnect,
 }: RemoteSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const stageRef = useRef<HTMLButtonElement>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
+  const lastRenderedFrameRef = useRef(0);
   const keyboardInputRef = useRef<HTMLInputElement>(null);
   const quickKeyboardInputRef = useRef<HTMLInputElement>(null);
   const inputHistoryRef = useRef(new WeakMap<HTMLInputElement, string>());
   const composingInputsRef = useRef(new WeakSet<HTMLInputElement>());
+  const clipboardRequestRef = useRef('');
   const nativeFullscreenRef = useRef(false);
   const pointerState = useRef({
     points: new Map<number, {
@@ -884,6 +1064,8 @@ function RemoteSurface({
     cursor: { x: 0.5, y: 0.5 } as RemotePoint,
     multi: null as null | {
       mode: 'pending' | 'pinch' | 'scroll';
+      startedAt: number;
+      tapCandidate: boolean;
       startDistance: number;
       startMidpoint: RemotePoint;
       lastMidpoint: RemotePoint;
@@ -891,11 +1073,15 @@ function RemoteSurface({
       anchorScreen: RemotePoint;
       movedPointers: Set<number>;
     },
+    twoFingerTapPending: false,
   });
   const contentBoxRef = useRef<RemoteRect>({ left: 0, top: 0, width: 0, height: 0 });
   const viewRef = useRef<RemoteView>({ scale: 1, centerX: 0.5, centerY: 0.5 });
   const [keyboardOpen, setKeyboardOpen] = useState(false);
   const [controlsOpen, setControlsOpen] = useState(false);
+  const [clipboardOpen, setClipboardOpen] = useState(false);
+  const [clipboardText, setClipboardText] = useState('');
+  const [clipboardStatus, setClipboardStatus] = useState('Clipboard transfers happen only when you press a button.');
   const [powerAction, setPowerAction] = useState<'restart' | 'shutdown' | null>(null);
   const [activeModifiers, setActiveModifiers] = useState<Modifier[]>([]);
   const [cursor, setCursor] = useState<RemotePoint>({ x: 0.5, y: 0.5 });
@@ -983,7 +1169,7 @@ function RemoteSurface({
     ));
   }, []);
 
-  const sendPointerAt = useCallback((action: 'move' | 'down' | 'up' | 'click', point: RemotePoint, button: 'left' | 'right' = 'left') => {
+  const sendPointerAt = useCallback((action: 'move' | 'down' | 'up' | 'click', point: RemotePoint, button: 'left' | 'right' | 'middle' = 'left') => {
     send({ type: 'pointer', action, x: point.x, y: point.y, button });
   }, [send]);
 
@@ -1007,6 +1193,7 @@ function RemoteSurface({
     state.suppressTap = false;
     state.longPressed = false;
     state.multi = null;
+    state.twoFingerTapPending = false;
     setMagnifierOpen(false);
   }, [sendPointerAt]);
 
@@ -1033,6 +1220,55 @@ function RemoteSurface({
       video.removeEventListener('playing', markVideoReady);
     };
   }, [measureStage, stream]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !stream) return;
+    let disposed = false;
+    let frameCallback = 0;
+    lastRenderedFrameRef.current = Date.now();
+
+    const markRenderedFrame = () => {
+      if (disposed) return;
+      lastRenderedFrameRef.current = Date.now();
+      frameCallback = video.requestVideoFrameCallback(markRenderedFrame);
+    };
+    if (typeof video.requestVideoFrameCallback === 'function') {
+      frameCallback = video.requestVideoFrameCallback(markRenderedFrame);
+    } else {
+      video.addEventListener('timeupdate', markFrameFallback);
+      video.addEventListener('playing', markFrameFallback);
+    }
+    function markFrameFallback() {
+      lastRenderedFrameRef.current = Date.now();
+    }
+
+    const watchdog = window.setInterval(() => {
+      if (
+        document.visibilityState === 'visible' && connectionState === 'connected'
+        && Date.now() - lastRenderedFrameRef.current > 12_000
+      ) {
+        lastRenderedFrameRef.current = Date.now();
+        setVideoReady(false);
+        send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabled });
+      }
+    }, 4_000);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(watchdog);
+      if (frameCallback && typeof video.cancelVideoFrameCallback === 'function') video.cancelVideoFrameCallback(frameCallback);
+      video.removeEventListener('timeupdate', markFrameFallback);
+      video.removeEventListener('playing', markFrameFallback);
+    };
+  }, [connectionState, send, stream, systemAudioEnabled]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = !systemAudioEnabled;
+    if (systemAudioEnabled) void video.play().catch(() => undefined);
+  }, [systemAudioEnabled]);
 
   useEffect(() => {
     const video = videoRef.current as WebkitPiPVideo | null;
@@ -1167,7 +1403,7 @@ function RemoteSurface({
     send({ type: 'key', action: event.repeat ? 'tap' : action, key: event.key });
   };
 
-  const sendPointer = useCallback((action: 'move' | 'down' | 'up' | 'click', button: 'left' | 'right' = 'left') => {
+  const sendPointer = useCallback((action: 'move' | 'down' | 'up' | 'click', button: 'left' | 'right' | 'middle' = 'left') => {
     sendPointerAt(action, pointerState.current.cursor, button);
     if (action === 'click') vibrate();
   }, [sendPointerAt, vibrate]);
@@ -1195,6 +1431,8 @@ function RemoteSurface({
     const distance = Math.hypot(points[1].clientX - points[0].clientX, points[1].clientY - points[0].clientY);
     state.multi = {
       mode: 'pending',
+      startedAt: performance.now(),
+      tapCandidate: true,
       startDistance: Math.max(distance, 1),
       startMidpoint: midpoint,
       lastMidpoint: midpoint,
@@ -1216,6 +1454,7 @@ function RemoteSurface({
       startY: event.clientY,
     });
     if (state.points.size === 1) {
+      state.twoFingerTapPending = false;
       state.primaryId = event.pointerId;
       state.moved = false;
       state.suppressTap = false;
@@ -1260,6 +1499,7 @@ function RemoteSurface({
       const spreadChange = Math.abs(distance - multi.startDistance);
       const midpointTravel = Math.hypot(midpoint.x - multi.startMidpoint.x, midpoint.y - multi.startMidpoint.y);
       multi.movedPointers.add(event.pointerId);
+      if (spreadChange > 7 || midpointTravel > 8) multi.tapCandidate = false;
       if (multi.mode === 'pending' && multi.movedPointers.size >= 2 && (spreadChange > 7 || midpointTravel > 8)) {
         multi.mode = spreadChange > midpointTravel * 0.7 ? 'pinch' : 'scroll';
       }
@@ -1306,12 +1546,34 @@ function RemoteSurface({
   const finishPointer = (event: ReactPointerEvent<HTMLButtonElement>, cancelled = false) => {
     event.preventDefault();
     const state = pointerState.current;
+    const pointCountBeforeRelease = state.points.size;
+    const multi = state.multi;
     const wasPrimarySingle = state.points.size === 1 && state.primaryId === event.pointerId;
     state.points.delete(event.pointerId);
+    if (pointCountBeforeRelease >= 2) {
+      state.twoFingerTapPending = Boolean(
+        !cancelled && pointCountBeforeRelease === 2 && multi?.mode === 'pending'
+        && multi.tapCandidate && performance.now() - multi.startedAt <= 420,
+      );
+      state.multi = null;
+      if (state.points.size === 1) {
+        const [remainingId, remaining] = Array.from(state.points.entries())[0];
+        remaining.startX = remaining.clientX;
+        remaining.startY = remaining.clientY;
+        state.primaryId = remainingId;
+        state.moved = false;
+        state.suppressTap = true;
+      } else {
+        state.primaryId = null;
+        state.twoFingerTapPending = false;
+      }
+      return;
+    }
     if (wasPrimarySingle) {
       clearTimeout(state.pressTimer);
       state.pressTimer = 0;
       if (state.mouseDown) sendPointerAt('up', state.cursor);
+      else if (!cancelled && state.twoFingerTapPending) sendPointer('click', 'middle');
       else if (!cancelled && !state.longPressed && !state.moved && !state.suppressTap && tapToClick) sendPointer('click');
       state.mouseDown = false;
       state.primaryId = null;
@@ -1319,6 +1581,7 @@ function RemoteSurface({
       state.moved = false;
       state.suppressTap = false;
       state.multi = null;
+      state.twoFingerTapPending = false;
       setMagnifierOpen(false);
       return;
     }
@@ -1417,6 +1680,48 @@ function RemoteSurface({
     input?.focus({ preventScroll: true });
   };
 
+  useEffect(() => {
+    if (!clipboardResult || clipboardResult.requestId !== clipboardRequestRef.current) return;
+    if (clipboardResult.action === 'read' && clipboardResult.ok) setClipboardText(clipboardResult.text ?? '');
+    setClipboardStatus(clipboardResult.message);
+    clipboardRequestRef.current = '';
+  }, [clipboardResult]);
+
+  const requestComputerClipboard = () => {
+    const requestId = createSecurityToken(12);
+    clipboardRequestRef.current = requestId;
+    setClipboardStatus('Reading the computer clipboard…');
+    if (!send({ type: 'clipboard-read', requestId })) setClipboardStatus('The computer is not connected.');
+  };
+
+  const sendClipboardToComputer = () => {
+    const requestId = createSecurityToken(12);
+    clipboardRequestRef.current = requestId;
+    setClipboardStatus('Sending text to the computer clipboard…');
+    if (!send({ type: 'clipboard-write', requestId, text: clipboardText.slice(0, MAX_CLIPBOARD_TEXT_LENGTH) })) {
+      setClipboardStatus('The computer is not connected.');
+    }
+  };
+
+  const pastePhoneClipboard = async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      setClipboardText(text.slice(0, MAX_CLIPBOARD_TEXT_LENGTH));
+      setClipboardStatus(text ? 'Phone clipboard loaded. Press Send to PC when ready.' : 'The phone clipboard is empty.');
+    } catch {
+      setClipboardStatus('Your browser blocked clipboard reading. Paste into the text box instead.');
+    }
+  };
+
+  const copyToPhoneClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(clipboardText);
+      setClipboardStatus('Copied to the phone clipboard.');
+    } catch {
+      setClipboardStatus('Your browser blocked clipboard writing. Select and copy the text manually.');
+    }
+  };
+
   const setPictureInPicture = async (enabled: boolean) => {
     const video = videoRef.current as WebkitPiPVideo | null;
     if (!video || !stream) return;
@@ -1463,6 +1768,9 @@ function RemoteSurface({
           <p>{statusText}{screenBlanked ? ' · Displays powered off' : ''} · {code.slice(0, 4)} {code.slice(4, 8)} {code.slice(8)}</p>
         </div>
         <div className="remote-topbar-actions">
+          <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => setClipboardOpen(true)} disabled={!hostCapabilities.clipboardText} aria-label="Open clipboard exchange">
+            <Clipboard className="size-5" />
+          </Button>
           <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => void setImmersiveMode(true)} aria-label="Enter fullscreen controller">
             <Maximize2 className="size-5" />
           </Button>
@@ -1484,13 +1792,14 @@ function RemoteSurface({
           onKeyDown={(event) => handleHardwareKey(event, 'down')}
           onKeyUp={(event) => handleHardwareKey(event, 'up')}
           onContextMenu={(event) => event.preventDefault()}
-          aria-label="Remote computer touchpad. Swipe to move, tap to click, hold for a magnified precision view, use two fingers to scroll, or pinch to zoom."
+          aria-label="Remote computer touchpad. Swipe to move, tap to left click, tap with two fingers for middle click, swipe with two fingers to scroll, hold for precision, or pinch to zoom."
         >
         <span className="remote-video-viewport" style={viewportStyle}>
+          {/* oxlint-disable-next-line jsx-a11y/media-has-caption -- This is a live desktop capture with no caption source. */}
           <video
             ref={videoRef}
             autoPlay
-            muted
+            muted={!systemAudioEnabled}
             playsInline
             className={`remote-video ${stream ? 'is-visible' : ''}`}
             style={videoStyle}
@@ -1523,12 +1832,12 @@ function RemoteSurface({
         )}
         {stream && (
           <span className="touch-hint">
-            {pointerMode === 'touchpad' ? 'Swipe to move' : 'Touch to position'} · Hold for 3× precision · Pinch to zoom
+            {pointerMode === 'touchpad' ? 'Swipe to move' : 'Touch to position'} · Two fingers: tap middle-click, swipe scroll · Pinch zoom
           </span>
         )}
         </button>
         {connected && (!stream || !videoReady) && (
-          <button type="button" className="stream-retry-button" onClick={() => send({ type: 'stream', action: 'request' })}>
+          <button type="button" className="stream-retry-button" onClick={() => send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabled })}>
             <RefreshCw /> {stream ? 'Restart screen' : 'Retry screen'}
           </button>
         )}
@@ -1546,6 +1855,15 @@ function RemoteSurface({
             <EyeOff /> Displays off <small>Turn on</small>
           </button>
         )}
+        <button
+          type="button"
+          className={`app-switcher-button ${screenBlanked ? 'is-lowered' : ''}`}
+          onClick={() => send({ type: 'key', action: 'tap', key: 'Tab', modifiers: ['Meta'] })}
+          disabled={!connected}
+          aria-label="Open Windows task view"
+        >
+          <PanelsTopLeft /><span>Apps</span>
+        </button>
         {dictationState !== 'idle' && dictationMessage && (
           <output className={`dictation-chip is-${dictationState}`} aria-live="polite">
             {dictationState === 'recording' ? <MicOff /> : <Mic />} {dictationMessage}
@@ -1718,6 +2036,32 @@ function RemoteSurface({
         </DrawerContent>
       </Drawer>
 
+      <Drawer open={clipboardOpen} onOpenChange={setClipboardOpen} showSwipeHandle>
+        <DrawerContent className="control-drawer clipboard-drawer">
+          <DrawerHeader className="text-left">
+            <DrawerTitle>Clipboard exchange</DrawerTitle>
+            <DrawerDescription>Text moves only when you press a transfer button. Images and files are never transferred.</DrawerDescription>
+          </DrawerHeader>
+          <div className="clipboard-content">
+            <Textarea
+              value={clipboardText}
+              onChange={(event) => setClipboardText(event.target.value.slice(0, MAX_CLIPBOARD_TEXT_LENGTH))}
+              maxLength={MAX_CLIPBOARD_TEXT_LENGTH}
+              placeholder="Paste or load clipboard text here…"
+              spellCheck={false}
+              aria-label="Clipboard text"
+            />
+            <output className="clipboard-status" aria-live="polite">{clipboardStatus}</output>
+            <div className="clipboard-actions">
+              <Button variant="outline" onClick={() => void pastePhoneClipboard()}><Clipboard /> Load phone</Button>
+              <Button onClick={sendClipboardToComputer} disabled={!connected}><ArrowRight /> Send to PC</Button>
+              <Button variant="outline" onClick={requestComputerClipboard} disabled={!connected}><Monitor /> Get from PC</Button>
+              <Button variant="outline" onClick={() => void copyToPhoneClipboard()}><Copy /> Copy to phone</Button>
+            </div>
+          </div>
+        </DrawerContent>
+      </Drawer>
+
       <Drawer open={controlsOpen} onOpenChange={setControlsOpen} showSwipeHandle>
         <DrawerContent className="control-drawer">
           <DrawerHeader className="text-left">
@@ -1754,6 +2098,16 @@ function RemoteSurface({
                 disabled={!pipSupported || !stream}
                 onCheckedChange={(checked) => void setPictureInPicture(checked)}
                 aria-label="Show the computer in picture-in-picture"
+              />
+            </div>
+            <div className="control-row">
+              <span className="control-row-icon"><Volume2 /></span>
+              <span><strong>Computer audio</strong><small>{hostCapabilities.systemAudio ? 'Stream system sound to this phone · off by default' : 'Update the Windows companion to enable'}</small></span>
+              <Switch
+                checked={systemAudioEnabled}
+                disabled={!connected || !hostCapabilities.systemAudio}
+                onCheckedChange={setSystemAudioEnabled}
+                aria-label="Stream computer audio to this phone"
               />
             </div>
             <div className="control-section-label">Pointer</div>
@@ -1809,6 +2163,14 @@ function RemoteSurface({
               <ShieldCheck className={dictationAvailable ? 'text-emerald-400' : 'opacity-30'} />
             </div>
             <div className="control-section-label">Session</div>
+            <button type="button" className="control-row" disabled={!hostCapabilities.clipboardText} onClick={() => { setControlsOpen(false); setClipboardOpen(true); }}>
+              <span className="control-row-icon"><Clipboard /></span><span><strong>Clipboard exchange</strong><small>{hostCapabilities.clipboardText ? 'Explicitly move text between phone and computer' : 'Update the Windows companion to enable'}</small></span><ArrowRight />
+            </button>
+            <div className="control-row">
+              <span className="control-row-icon safe"><ShieldCheck /></span>
+              <span><strong>{trustedDevice ? 'Trusted phone' : 'Temporary pairing'}</strong><small>{trustedDevice ? 'Reconnects with a revocable device key' : hostCapabilities.trustedReconnect ? 'The computer is creating a trusted credential' : 'Compatible connection · update the companion for trusted reconnect'}</small></span>
+              {trustedDevice ? <Button variant="ghost" size="sm" onClick={forgetTrustedDevice}>Forget</Button> : <span />}
+            </div>
             {connected && (
               <button
                 type="button"
