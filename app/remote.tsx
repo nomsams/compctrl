@@ -500,8 +500,10 @@ export function RemoteController() {
     let attempt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let mediaRetryTimer: ReturnType<typeof setTimeout> | null = null;
+    let connectionDeadline: ReturnType<typeof setTimeout> | null = null;
     let peer: ReturnType<typeof newPeer> | null = null;
     let connection: DataConnection | null = null;
+    let transportGeneration = 0;
     let trustedCredential = readTrustedCredential(sessionCode);
     if (trustedCredential && trustedCredential.deviceId !== deviceIdRef.current) {
       window.localStorage.removeItem(trustedStorageKey(sessionCode));
@@ -522,6 +524,8 @@ export function RemoteController() {
     };
 
     const cleanTransport = () => {
+      if (connectionDeadline) clearTimeout(connectionDeadline);
+      connectionDeadline = null;
       const recorder = recorderRef.current;
       if (recorder?.state === 'recording') {
         recorder.onstop = null;
@@ -544,8 +548,8 @@ export function RemoteController() {
       if (peer && !peer.destroyed) peer.destroy();
     };
 
-    const scheduleReconnect = () => {
-      if (disposed || retryTimer) return;
+    const scheduleReconnect = (failedGeneration = transportGeneration) => {
+      if (disposed || retryTimer || failedGeneration !== transportGeneration) return;
       setDictationAvailable(false);
       setConnectionState(navigator.onLine ? 'reconnecting' : 'offline');
       setHostNotice(navigator.onLine ? 'Control connection lost. Reconnecting…' : 'Phone is offline.');
@@ -556,6 +560,7 @@ export function RemoteController() {
       setRetryCount(attempt);
       retryTimer = setTimeout(() => {
         retryTimer = null;
+        transportGeneration += 1;
         cleanTransport();
         connect();
       }, delay);
@@ -563,20 +568,28 @@ export function RemoteController() {
 
     const connect = () => {
       if (disposed) return;
+      const currentGeneration = ++transportGeneration;
       setConnectionState(attempt === 0 ? 'connecting' : 'reconnecting');
       setDisplayControlSupported(false);
       const activePeer = newPeer();
       peer = activePeer;
 
       activePeer.on('open', () => {
-        if (disposed) return;
+        if (disposed || currentGeneration !== transportGeneration) return;
         const credential = trustedCredential;
-        const authMode = credential ? 'trusted' as const : 'code' as const;
+        // A stale trusted rendezvous used to trap the controller forever. Every
+        // third connection attempt also tries the QR-code rendezvous, while
+        // retaining the trusted credential in case the outage is temporary.
+        const useTrustedCredential = Boolean(credential) && attempt % 3 !== 2;
+        const authMode = useTrustedCredential ? 'trusted' as const : 'code' as const;
         const connectionProtocol = credential ? PROTOCOL_VERSION : (attempt % 2 === 0 ? PROTOCOL_VERSION : 2);
-        const hostIdPromise = credential ? Promise.resolve(credential.hostId) : peerIdForCode(sessionCode);
+        const hostIdPromise = useTrustedCredential && credential ? Promise.resolve(credential.hostId) : peerIdForCode(sessionCode);
+        if (credential && !useTrustedCredential) {
+          setHostNotice('Saved connection unavailable. Trying the QR-code rendezvous…');
+        }
         void hostIdPromise.then((hostId) => {
-          if (disposed || activePeer.destroyed) return;
-          connection = activePeer.connect(hostId, {
+          if (disposed || activePeer.destroyed || currentGeneration !== transportGeneration) return;
+          const activeConnection = activePeer.connect(hostId, {
             reliable: true,
             serialization: 'json',
             metadata: {
@@ -587,24 +600,31 @@ export function RemoteController() {
               deviceName: controllerDeviceName(),
             },
           });
+          connection = activeConnection;
+          connectionDeadline = setTimeout(() => {
+            if (currentGeneration === transportGeneration && connectionRef.current !== activeConnection) {
+              setHostNotice('The computer did not answer. Trying another secure route…');
+              scheduleReconnect(currentGeneration);
+            }
+          }, 12_000);
 
-          connection.on('open', () => {
+          activeConnection.on('open', () => {
             setHostNotice('Authenticating this phone…');
           });
-          connection.on('data', (data) => {
+          activeConnection.on('data', (data) => {
             if (!isHostMessage(data)) {
-              connection?.close();
+              activeConnection.close();
               return;
             }
             const message: HostMessage = data;
             if (message.type === 'auth-challenge') {
               const nonce = createSecurityToken();
-              const proofPromise = credential
+              const proofPromise = useTrustedCredential && credential
                 ? authProofForTrustedToken(credential.token, message.challenge, nonce)
                 : authProofForCode(sessionCode, message.challenge, nonce);
               void proofPromise.then((proof) => {
-                if (!disposed && connection?.open) {
-                  void connection.send({
+                if (!disposed && activeConnection.open && currentGeneration === transportGeneration) {
+                  void activeConnection.send({
                     type: 'auth-response',
                     method: authMode,
                     challenge: message.challenge,
@@ -613,13 +633,13 @@ export function RemoteController() {
                     deviceId: deviceIdRef.current,
                   } satisfies ControllerMessage);
                 }
-              }).catch(scheduleReconnect);
+              }).catch(() => scheduleReconnect(currentGeneration));
               return;
             }
             if (message.type === 'auth-rejected') {
               if (message.reason === 'session-busy') {
                 setHostNotice('Another phone is actively connected. Retrying when that session ends…');
-                connection?.close();
+                activeConnection.close();
                 return;
               }
               if (authMode === 'trusted') {
@@ -628,12 +648,14 @@ export function RemoteController() {
                 setTrustedDevice(false);
                 setHostNotice('This phone is no longer trusted. Trying the current pairing code…');
               }
-              connection?.close();
+              activeConnection.close();
               return;
             }
             if (message.type === 'auth-ok') {
-              if (!connection) return;
-              connectionRef.current = connection;
+              if (!activeConnection.open || currentGeneration !== transportGeneration) return;
+              if (connectionDeadline) clearTimeout(connectionDeadline);
+              connectionDeadline = null;
+              connectionRef.current = activeConnection;
               attempt = 0;
               setRetryCount(0);
               lastPongRef.current = Date.now();
@@ -652,9 +674,9 @@ export function RemoteController() {
             }
             if (message.type === 'trusted-credential') {
               if (message.deviceId !== deviceIdRef.current) return;
-              if (trustedCredential && message.hostId !== trustedCredential.hostId) {
+              if (authMode === 'trusted' && trustedCredential && message.hostId !== trustedCredential.hostId) {
                 setHostNotice('Blocked an unexpected trusted-computer identity change. Re-scan the computer QR code to approve it.');
-                connection?.close();
+                activeConnection.close();
                 return;
               }
               trustedCredential = {
@@ -665,8 +687,20 @@ export function RemoteController() {
                 token: message.token,
                 expiresAt: message.expiresAt,
               };
-              window.localStorage.setItem(trustedStorageKey(sessionCode), JSON.stringify(trustedCredential));
-              setTrustedDevice(true);
+              try {
+                window.localStorage.setItem(trustedStorageKey(sessionCode), JSON.stringify(trustedCredential));
+                setTrustedDevice(true);
+                if (message.requiresAck) {
+                  void activeConnection.send({
+                    type: 'trusted-credential-ack',
+                    deviceId: message.deviceId,
+                  } satisfies ControllerMessage);
+                }
+              } catch {
+                trustedCredential = null;
+                setTrustedDevice(false);
+                setHostNotice('Connected, but this browser could not save its trusted-device key. Keep the QR code available.');
+              }
               return;
             }
             if (message.type === 'clipboard-result') {
@@ -711,9 +745,9 @@ export function RemoteController() {
               else if (message.status === 'error') setDictationState('error');
             }
           });
-          connection.on('close', scheduleReconnect);
-          connection.on('error', scheduleReconnect);
-        }).catch(scheduleReconnect);
+          activeConnection.on('close', () => scheduleReconnect(currentGeneration));
+          activeConnection.on('error', () => scheduleReconnect(currentGeneration));
+        }).catch(() => scheduleReconnect(currentGeneration));
       });
 
       activePeer.on('call', (incomingCall) => {
@@ -823,9 +857,9 @@ export function RemoteController() {
         incomingCall.on('error', recoverMedia);
       });
 
-      activePeer.on('disconnected', scheduleReconnect);
-      activePeer.on('close', scheduleReconnect);
-      activePeer.on('error', scheduleReconnect);
+      activePeer.on('disconnected', () => scheduleReconnect(currentGeneration));
+      activePeer.on('close', () => scheduleReconnect(currentGeneration));
+      activePeer.on('error', () => scheduleReconnect(currentGeneration));
     };
 
     connect();
@@ -842,6 +876,7 @@ export function RemoteController() {
       if (!disposed && !connectionRef.current?.open) {
         if (retryTimer) clearTimeout(retryTimer);
         retryTimer = null;
+        transportGeneration += 1;
         cleanTransport();
         attempt = 0;
         connect();

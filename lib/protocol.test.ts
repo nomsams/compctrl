@@ -42,6 +42,8 @@ void test('rejects malformed or oversized remote-control messages', () => {
   assert.equal(isControllerMessage({ type: 'clipboard-write', requestId: 'abcdefghijklmnop', text: 'x'.repeat(70_000) }), false);
   assert.equal(isControllerMessage({ type: 'stream', action: 'request', systemAudio: false }), true);
   assert.equal(isControllerMessage({ type: 'stream', action: 'request', systemAudio: 'yes' }), false);
+  assert.equal(isControllerMessage({ type: 'trusted-credential-ack', deviceId: 'device_abcdefghijkl' }), true);
+  assert.equal(isControllerMessage({ type: 'trusted-credential-ack', deviceId: '../bad device' }), false);
   assert.equal(isControllerMessage({ type: 'system', action: 'format-disk' }), false);
 });
 
@@ -91,6 +93,14 @@ void test('validates security capability updates and busy-session rejection', ()
     hostId: 'hostId_abcdefghijkl',
     token: 'token_abcdefghijkl',
     expiresAt: Date.now() + 60_000,
+    requiresAck: true,
   }), true);
+  assert.equal(isHostMessage({
+    type: 'trusted-credential',
+    deviceId: 'device_abcdefghijkl',
+    hostId: 'hostId_abcdefghijkl',
+    token: 'token_abcdefghijkl',
+    requiresAck: 'yes',
+  }), false);
   assert.equal(isHostMessage({ type: 'status', jigglerEnabled: false, screenBlanked: false, dictationAvailable: false, capabilities: { ...capabilities, remoteInput: 'yes' } }), false);
 });

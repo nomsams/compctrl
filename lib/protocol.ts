@@ -56,6 +56,7 @@ export type AuthResponseMessage = {
   proof: string;
   deviceId?: string;
 };
+export type TrustedCredentialAckMessage = { type: 'trusted-credential-ack'; deviceId: string };
 export type ClipboardMessage =
   | { type: 'clipboard-read'; requestId: string }
   | { type: 'clipboard-write'; requestId: string; text: string };
@@ -76,6 +77,7 @@ export type ControllerMessage =
   | SystemMessage
   | PingMessage
   | AuthResponseMessage
+  | TrustedCredentialAckMessage
   | ClipboardMessage
   | DictationMessage;
 
@@ -83,7 +85,7 @@ export type HostMessage =
   | { type: 'auth-challenge'; challenge: string }
   | { type: 'auth-ok' }
   | { type: 'auth-rejected'; reason: 'trusted-device-revoked' | 'authentication-failed' | 'session-busy' }
-  | { type: 'trusted-credential'; deviceId: string; hostId: string; token: string; expiresAt?: number }
+  | { type: 'trusted-credential'; deviceId: string; hostId: string; token: string; expiresAt?: number; requiresAck?: boolean }
   | {
     type: 'ready';
     computerName: string;
@@ -218,6 +220,8 @@ export function isControllerMessage(value: unknown): value is ControllerMessage 
         && typeof value.nonce === 'string' && tokenPattern.test(value.nonce)
         && typeof value.proof === 'string' && tokenPattern.test(value.proof)
         && (value.deviceId === undefined || (typeof value.deviceId === 'string' && tokenPattern.test(value.deviceId)));
+    case 'trusted-credential-ack':
+      return typeof value.deviceId === 'string' && tokenPattern.test(value.deviceId);
     case 'clipboard-read':
       return typeof value.requestId === 'string' && tokenPattern.test(value.requestId);
     case 'clipboard-write':
@@ -249,7 +253,8 @@ export function isHostMessage(value: unknown): value is HostMessage {
       return typeof value.deviceId === 'string' && tokenPattern.test(value.deviceId)
         && typeof value.hostId === 'string' && peerIdPattern.test(value.hostId)
         && typeof value.token === 'string' && tokenPattern.test(value.token)
-        && (value.expiresAt === undefined || (isFiniteNumber(value.expiresAt) && value.expiresAt > 0));
+        && (value.expiresAt === undefined || (isFiniteNumber(value.expiresAt) && value.expiresAt > 0))
+        && (value.requiresAck === undefined || typeof value.requiresAck === 'boolean');
     case 'ready':
       return typeof value.computerName === 'string' && value.computerName.length <= 128
         && typeof value.jigglerEnabled === 'boolean' && typeof value.screenBlanked === 'boolean'

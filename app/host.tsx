@@ -453,6 +453,7 @@ export function HostController() {
         let challenge = '';
         let messageWindowStarted = Date.now();
         let messagesInWindow = 0;
+        let credentialAwaitingAckForDevice = '';
         const authDeadline = window.setTimeout(() => incoming.close(), 8_000);
 
         incoming.on('open', () => {
@@ -543,21 +544,18 @@ export function HostController() {
                   const credential = await api.issueTrustedDevice(data.deviceId, safeName);
                   if (disposed || connectionRef.current !== incoming) return;
                   setTrustedDevices(credential.devices);
+                  credentialAwaitingAckForDevice = credential.deviceId;
                   void incoming.send({
                     type: 'trusted-credential',
                     deviceId: credential.deviceId,
                     hostId: credential.hostId,
                     token: credential.token,
                     expiresAt: credential.expiresAt,
+                    requiresAck: true,
                   } satisfies HostMessage);
                 } catch {
                   void incoming.send({ type: 'notice', message: 'Connected, but this phone could not be saved as a trusted device.' } satisfies HostMessage);
                 }
-              }
-              if (mode === 'code' && modernDevice && securityRef.current.trustedReconnectEnabled) {
-                const replacement = createPairingCode();
-                pendingPairingCodeRef.current = replacement;
-                void api.saveSettings({ pairingCode: replacement });
               }
               if (disposed || connectionRef.current !== incoming) return;
               const capabilities = capabilitiesFor(securityRef.current);
@@ -590,6 +588,18 @@ export function HostController() {
           if (messagesInWindow > 400) {
             setNotice('Disconnected a controller that exceeded the safety rate limit.');
             incoming.close();
+            return;
+          }
+          if (data.type === 'trusted-credential-ack') {
+            if (
+              mode === 'code' && credentialAwaitingAckForDevice
+              && data.deviceId === credentialAwaitingAckForDevice
+            ) {
+              credentialAwaitingAckForDevice = '';
+              const replacement = createPairingCode();
+              pendingPairingCodeRef.current = replacement;
+              void api.saveSettings({ pairingCode: replacement });
+            }
             return;
           }
           if (data.type !== 'auth-response') void handleControllerMessage(data);
