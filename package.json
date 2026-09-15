@@ -1,7 +1,7 @@
 {
   "name": "compctrl",
   "productName": "CompCtrl",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Peer-to-peer phone controller for Windows",
   "author": "CompCtrl contributors",
   "private": true,
@@ -18,6 +18,7 @@
     "pack:windows": "npm run build:desktop && npm run verify:desktop-bundle && node scripts/create-integrity-manifest.mjs && electron-builder --win nsis portable --publish never && node scripts/create-checksums.mjs",
     "start": "wrangler dev --config dist/server/wrangler.json",
     "test:geometry": "node --experimental-strip-types --test lib/*.test.ts companion/*.test.cjs",
+    "test:capture:windows": "electron scripts/capture-smoke.cjs --disable-wgc --webrtc-loopback",
     "lint": "oxlint app lib",
     "format": "oxfmt"
   },

@@ -153,9 +153,9 @@ button, input { font: inherit; }
 .remote-stage-wrap { position: relative; display: grid; min-width: 0; min-height: 0; overflow: hidden; }
 .remote-video-stage { position: relative; display: grid; width: 100%; min-height: 0; place-items: center; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; border: 0; padding: 0; color: inherit; outline: none; background: radial-gradient(circle at 50% 40%,#1a2130,#090c12 55%); cursor: crosshair; }
 .remote-video-stage:focus-visible { box-shadow: inset 0 0 0 2px rgba(93,130,255,.8); }
-.remote-video-viewport { position: absolute; display: block; overflow: hidden; pointer-events: none; background: #05070b; contain: strict; }
-.remote-video { display: block; width: 100%; height: 100%; transform-origin: 0 0; object-fit: fill; opacity: 0; will-change: transform; transition: opacity .2s ease; }
-.remote-video.is-visible { opacity: 1; }
+.remote-video-viewport { position: absolute; display: block; overflow: hidden; pointer-events: none; background: #05070b; }
+.remote-video { display: block; width: 100%; height: 100%; transform-origin: 0 0; object-fit: fill; visibility: hidden; }
+.remote-video.is-visible { visibility: visible; }
 .remote-cursor { position: absolute; z-index: 3; display: grid; width: 2.6rem; height: 2.6rem; transform: translate(-.34rem,-.28rem); place-items: start; filter: drop-shadow(0 2px 3px rgba(0,0,0,.8)); transition: filter .15s ease; }
 .remote-cursor::after { content: ''; position: absolute; left: .1rem; top: .1rem; width: 1rem; height: 1rem; transform: translate(-50%,-50%); border: 2px solid rgba(93,130,255,.95); border-radius: 50%; box-shadow: 0 0 0 4px rgba(49,94,251,.2); }
 .remote-cursor svg { position: relative; z-index: 2; width: 2.15rem; height: 2.15rem; fill: white; stroke: #101522; stroke-width: 1.8; }
@@ -170,6 +170,7 @@ button, input { font: inherit; }
 .stream-retry-button { position: absolute; z-index: 9; left: 50%; bottom: 3.3rem; display: flex; height: 2.45rem; transform: translateX(-50%); align-items: center; gap: .42rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(8,11,17,.82); padding: 0 .85rem; color: rgba(255,255,255,.88); font-size: .7rem; font-weight: 650; box-shadow: 0 8px 24px rgba(0,0,0,.28); backdrop-filter: blur(10px); }
 .stream-retry-button:active { transform: translateX(-50%) scale(.96); background: rgba(49,94,251,.9); }
 .stream-retry-button svg { width: .9rem; }
+.stream-diagnostic { position: absolute; z-index: 8; left: 50%; top: .75rem; width: min(92%,32rem); transform: translateX(-50%); border: 1px solid rgba(255,181,71,.35); border-radius: .7rem; background: rgba(35,24,8,.9); padding: .55rem .7rem; color: #ffd28d; font-size: .68rem; line-height: 1.4; text-align: center; pointer-events: none; }
 .touch-hint { position: absolute; z-index: 5; left: 50%; bottom: .8rem; transform: translateX(-50%); width: max-content; max-width: 92%; padding: .42rem .7rem; border-radius: 999px; background: rgba(8,11,17,.68); color: rgba(255,255,255,.68); font-size: .66rem; pointer-events: none; backdrop-filter: blur(8px); animation: hint-away .4s 7s forwards; }
 .view-zoom-reset { position: absolute; z-index: 7; right: .75rem; top: .75rem; display: flex; height: 2.15rem; align-items: center; gap: .35rem; border: 1px solid rgba(255,255,255,.16); border-radius: 999px; background: rgba(8,11,17,.78); padding: 0 .72rem; color: rgba(255,255,255,.88); font-size: .68rem; font-weight: 650; box-shadow: 0 8px 24px rgba(0,0,0,.25); backdrop-filter: blur(10px); }
 .view-zoom-reset svg { width: .85rem; }

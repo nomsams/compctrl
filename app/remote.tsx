@@ -1,5 +1,7 @@
 'use client';
 
+/* oxlint-disable jsx-a11y/prefer-tag-over-role -- The touch surface must not be a button containing live video; that composition renders black in some mobile WebViews. */
+
 import {
   ArrowRight,
   Camera,
@@ -275,6 +277,7 @@ export function RemoteController() {
   const [dictationState, setDictationState] = useState<DictationState>('idle');
   const [dictationMessage, setDictationMessage] = useState('');
   const [hostNotice, setHostNotice] = useState('');
+  const [mediaDiagnostic, setMediaDiagnostic] = useState('');
   const [trustedDevice, setTrustedDevice] = useState(false);
   const [clipboardResult, setClipboardResult] = useState<ClipboardResult | null>(null);
   const [systemAudioEnabled, setSystemAudioEnabled] = useState(false);
@@ -528,6 +531,7 @@ export function RemoteController() {
       stopRecorderTracks();
       setDictationState('idle');
       setDictationAvailable(false);
+      setMediaDiagnostic('');
       hostCapabilitiesRef.current = NO_HOST_CAPABILITIES;
       setHostCapabilities(NO_HOST_CAPABILITIES);
       connection?.close();
@@ -727,12 +731,50 @@ export function RemoteController() {
         if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
         mediaRetryTimer = null;
         setHostNotice('Receiving desktop video…');
+        setMediaDiagnostic('');
         const streamTimeout = window.setTimeout(() => {
           if (callRef.current !== incomingCall) return;
           setHostNotice('Desktop video timed out. Retrying…');
           incomingCall.close();
         }, 12_000);
         let remoteVideoTrack: MediaStreamTrack | null = null;
+        let statsTimer = 0;
+        const statsStartedAt = Date.now();
+        const inspectMediaTransport = async () => {
+          if (callRef.current !== incomingCall) return;
+          const peerConnection = incomingCall.peerConnection;
+          const iceState = peerConnection?.iceConnectionState ?? 'unknown';
+          if (iceState === 'failed') {
+            setMediaDiagnostic('The video connection failed while the mouse connection remained active. Check that both devices are on the same Wi-Fi, then restart the screen stream.');
+            return;
+          }
+          if (!peerConnection || Date.now() - statsStartedAt < 5_000) return;
+          try {
+            const reports = await peerConnection.getStats();
+            let inboundVideo: Record<string, unknown> | undefined;
+            for (const report of reports.values()) {
+              const candidate = report as unknown as Record<string, unknown>;
+              if (candidate.type === 'inbound-rtp' && (candidate.kind === 'video' || candidate.mediaType === 'video') && candidate.isRemote !== true) {
+                inboundVideo = candidate;
+              }
+            }
+            if (!inboundVideo) {
+              if (iceState === 'checking' || iceState === 'new') setMediaDiagnostic('The phone is still negotiating the video path. Mouse control uses a separate connection.');
+              return;
+            }
+            const bytesReceived = Number(inboundVideo.bytesReceived ?? 0);
+            const framesDecoded = Number(inboundVideo.framesDecoded ?? 0);
+            if (bytesReceived === 0) {
+              setMediaDiagnostic('The phone received the screen track but no video packets. Restart the screen stream and keep both devices on the same Wi-Fi.');
+            } else if ('framesDecoded' in inboundVideo && framesDecoded === 0) {
+              setMediaDiagnostic('Video packets reached the phone, but this browser has not decoded a frame. Tap Play screen or try the phone\'s current Chrome/Safari browser.');
+            } else {
+              setMediaDiagnostic('');
+            }
+          } catch {
+            // Some older mobile WebViews do not expose WebRTC statistics.
+          }
+        };
         const markMediaLive = () => {
           if (callRef.current !== incomingCall) return;
           window.clearTimeout(streamTimeout);
@@ -740,6 +782,7 @@ export function RemoteController() {
         };
         const recoverMedia = () => {
           window.clearTimeout(streamTimeout);
+          window.clearInterval(statsTimer);
           remoteVideoTrack?.removeEventListener('unmute', markMediaLive);
           remoteVideoTrack?.removeEventListener('ended', recoverMedia);
           if (callRef.current !== incomingCall) return;
@@ -754,6 +797,7 @@ export function RemoteController() {
           }
         };
         incomingCall.answer();
+        statsTimer = window.setInterval(() => void inspectMediaTransport(), 2_500);
         incomingCall.on('stream', (remoteStream) => {
           if (callRef.current !== incomingCall) {
             remoteStream.getTracks().forEach((track) => track.stop());
@@ -888,6 +932,7 @@ export function RemoteController() {
         retryCount={retryCount}
         stream={stream}
         hostNotice={hostNotice}
+        mediaDiagnostic={mediaDiagnostic}
         trustedDevice={trustedDevice}
         hostCapabilities={hostCapabilities}
         clipboardResult={clipboardResult}
@@ -1058,6 +1103,7 @@ type RemoteSurfaceProps = {
   retryCount: number;
   stream: MediaStream | null;
   hostNotice: string;
+  mediaDiagnostic: string;
   trustedDevice: boolean;
   hostCapabilities: HostCapabilities;
   clipboardResult: ClipboardResult | null;
@@ -1085,6 +1131,7 @@ function RemoteSurface({
   retryCount,
   stream,
   hostNotice,
+  mediaDiagnostic,
   trustedDevice,
   hostCapabilities,
   clipboardResult,
@@ -1105,7 +1152,7 @@ function RemoteSurface({
   reconnect,
 }: RemoteSurfaceProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const stageRef = useRef<HTMLButtonElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastRenderedFrameRef = useRef(0);
   const keyboardInputRef = useRef<HTMLInputElement>(null);
@@ -1160,6 +1207,7 @@ function RemoteSurface({
   const [pipSupported, setPipSupported] = useState(false);
   const [pipActive, setPipActive] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
+  const [blackFrameDetected, setBlackFrameDetected] = useState(false);
   const [pointerMode, setPointerMode] = useState<'touchpad' | 'direct'>(() => {
     if (typeof window === 'undefined') return 'touchpad';
     return window.localStorage.getItem('compctrl.pointerMode') === 'direct' ? 'direct' : 'touchpad';
@@ -1268,25 +1316,56 @@ function RemoteSurface({
     const video = videoRef.current;
     if (!video) return;
     setVideoReady(false);
+    setBlackFrameDetected(false);
     video.srcObject = stream;
     const markVideoReady = () => {
       setVideoReady(true);
       measureStage();
     };
-    if (stream) {
-      if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0) markVideoReady();
-      void video.play().catch(() => setVideoReady(false));
-    }
+    if (stream) void video.play().catch(() => setVideoReady(false));
     measureStage();
     video.addEventListener('resize', measureStage);
-    video.addEventListener('loadeddata', markVideoReady);
     video.addEventListener('playing', markVideoReady);
     return () => {
       video.removeEventListener('resize', measureStage);
-      video.removeEventListener('loadeddata', markVideoReady);
       video.removeEventListener('playing', markVideoReady);
     };
   }, [measureStage, stream]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !stream) {
+      setBlackFrameDetected(false);
+      return;
+    }
+    let consecutiveBlackFrames = 0;
+    const canvas = document.createElement('canvas');
+    canvas.width = 48;
+    canvas.height = 27;
+    const context = canvas.getContext('2d', { willReadFrequently: true });
+    const inspectFrame = () => {
+      if (!context || video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || video.videoWidth <= 0) return;
+      try {
+        context.drawImage(video, 0, 0, canvas.width, canvas.height);
+        const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        let signaledPixels = 0;
+        for (let index = 0; index < pixels.length; index += 4) {
+          if (pixels[index] + pixels[index + 1] + pixels[index + 2] > 18) signaledPixels += 1;
+        }
+        if (signaledPixels < pixels.length / 400) {
+          consecutiveBlackFrames += 1;
+          if (consecutiveBlackFrames >= 3) setBlackFrameDetected(true);
+        } else {
+          consecutiveBlackFrames = 0;
+          setBlackFrameDetected(false);
+        }
+      } catch {
+        // MediaStream video is normally canvas-readable; ignore restrictive WebViews.
+      }
+    };
+    const timer = window.setInterval(inspectFrame, 1_500);
+    return () => window.clearInterval(timer);
+  }, [stream]);
 
   useEffect(() => {
     const video = videoRef.current;
@@ -1464,7 +1543,7 @@ function RemoteSurface({
     return () => cancelAnimationFrame(frame);
   }, [magnifierVisible]);
 
-  const handleHardwareKey = (event: ReactKeyboardEvent<HTMLButtonElement>, action: 'down' | 'up') => {
+  const handleHardwareKey = (event: ReactKeyboardEvent<HTMLDivElement>, action: 'down' | 'up') => {
     if (!hostCapabilities.remoteInput) return;
     if (event.nativeEvent.isComposing || event.key === 'Unidentified') return;
     event.preventDefault();
@@ -1510,7 +1589,7 @@ function RemoteSurface({
     };
   };
 
-  const onPointerDown = (event: ReactPointerEvent<HTMLButtonElement>) => {
+  const onPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.currentTarget.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -1550,7 +1629,7 @@ function RemoteSurface({
     }
   };
 
-  const onPointerMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
+  const onPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     const state = pointerState.current;
     const previous = state.points.get(event.pointerId);
@@ -1611,7 +1690,7 @@ function RemoteSurface({
     moveCursor(next);
   };
 
-  const finishPointer = (event: ReactPointerEvent<HTMLButtonElement>, cancelled = false) => {
+  const finishPointer = (event: ReactPointerEvent<HTMLDivElement>, cancelled = false) => {
     event.preventDefault();
     const state = pointerState.current;
     const pointCountBeforeRelease = state.points.size;
@@ -1852,9 +1931,11 @@ function RemoteSurface({
       </header>
 
       <div className="remote-stage-wrap">
-        <button
+        {/* A real button cannot legally contain video and causes black compositing on some mobile WebViews. */}
+        <div
           ref={stageRef}
-          type="button"
+          role="button"
+          tabIndex={0}
           className="remote-video-stage"
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
@@ -1906,10 +1987,23 @@ function RemoteSurface({
             {hostCapabilities.remoteInput ? `${pointerMode === 'touchpad' ? 'Swipe to move' : 'Touch to position'} · Two fingers: tap middle-click, swipe scroll · Pinch zoom` : 'View-only mode · enable mouse and keyboard on the computer'}
           </span>
         )}
-        </button>
+        </div>
+        {(blackFrameDetected || mediaDiagnostic) && (
+          <span className="stream-diagnostic">
+            {blackFrameDetected ? 'Black video frames detected. Restart the stream; if this remains, report the diagnostic shown in Session controls.' : mediaDiagnostic}
+          </span>
+        )}
         {connected && (!stream || !videoReady) && (
-          <button type="button" className="stream-retry-button" onClick={() => send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabled })}>
-            <RefreshCw /> {stream ? 'Restart screen' : 'Retry screen'}
+          <button
+            type="button"
+            className="stream-retry-button"
+            onClick={() => {
+              const video = videoRef.current;
+              if (stream && video?.paused) void video.play().catch(() => setVideoReady(false));
+              else send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabled });
+            }}
+          >
+            <RefreshCw /> {stream && videoRef.current?.paused ? 'Play screen' : stream ? 'Restart screen' : 'Retry screen'}
           </button>
         )}
         {stream && view.scale > 1.01 && (
@@ -2249,6 +2343,16 @@ function RemoteSurface({
               <span><strong>{trustedDevice ? 'Trusted phone' : 'Temporary pairing'}</strong><small>{trustedDevice ? 'Reconnects with a revocable device key' : hostCapabilities.trustedReconnect ? 'The computer is creating a trusted credential' : 'Compatible connection · update the companion for trusted reconnect'}</small></span>
               {trustedDevice ? <Button variant="ghost" size="sm" onClick={forgetTrustedDevice}>Forget</Button> : <span />}
             </div>
+            {connected && (
+              <div className="control-row">
+                <span className="control-row-icon"><Monitor /></span>
+                <span>
+                  <strong>Video diagnostics</strong>
+                  <small>{blackFrameDetected ? 'Frames decode, but their sampled pixels are black' : mediaDiagnostic || (videoReady ? 'Frames are arriving and playing' : 'Waiting for the first playable frame')}</small>
+                </span>
+                <span />
+              </div>
+            )}
             {connected && (
               <button
                 type="button"

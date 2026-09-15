@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.1-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.2-x64.exe
 ```
 
 ## Controls
@@ -63,7 +63,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
 - If **Remember trusted phones** is enabled on Windows, the first successful code connection creates a high-entropy per-device credential. It rotates after every reconnect, expires after 30 days or 7 inactive days, and can be revoked locally. The temporary QR/code becomes single-use for modern controllers.
 - A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active computer across a page reload. Disconnecting manually disables auto-reconnect without revoking the phone.
-- Screen capture has its own recovery path: the phone reports the companion's capture status, retries stalled video automatically, and provides a **Retry screen** button without disconnecting mouse or keyboard control.
+- Screen capture has its own recovery path: the phone reports whether the media path received packets, decoded frames, or produced black pixels; retries stalled video automatically; and provides **Play screen** and **Retry screen** actions without disconnecting mouse or keyboard control.
 - Protocol 3 keeps screen/control compatibility with protocol 2 during staged upgrades. A new phone controller automatically retries the previous protocol, and a new companion accepts the previous published controller, preventing a cached or not-yet-deployed page from becoming a black screen.
 - If a browser or display driver leaves a live stream black or frozen, use **Session controls → Restart screen stream** to force a fresh desktop capture without re-pairing.
 

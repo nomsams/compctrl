@@ -29,11 +29,18 @@ const {
   trustedDeviceExpiry,
 } = require('./security.cjs');
 
-// Some Windows systems cannot start Electron's GPU subprocess (for example
-// after a graphics-driver update or on stripped-down/RDP sessions).  The host
-// UI and WebRTC desktop capture work with software rendering, so prefer the
-// reliable path instead of leaving the companion as a blank white window.
-app.disableHardwareAcceleration();
+// Desktop capture and WebRTC encoding should use the GPU by default. Forcing
+// software rendering can produce valid local pixels but black encoded frames
+// on some Windows graphics stacks. Keep an explicit troubleshooting escape
+// hatch without degrading every installation.
+if (process.argv.includes('--software-rendering')) app.disableHardwareAcceleration();
+
+// Chromium automatically enables Windows Graphics Capture for full-screen
+// capture on Windows 11 24H2. Electron/Chromium have open WGC failures on some
+// adapters, so use the mature DXGI/GDI fallback for the monitor stream.
+if (process.platform === 'win32') {
+  app.commandLine.appendSwitch('disable-features', 'WebRtcAllowWgcScreenCapturer');
+}
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 12;
