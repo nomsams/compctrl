@@ -53,7 +53,6 @@ declare global {
       >;
       revokeTrustedDevice(deviceId: string): Promise<Array<{ id: string; name: string; createdAt: number; lastSeenAt: number; expiresAt: number }>>;
       panicLockdown(): Promise<void>;
-      hideWindow(): Promise<void>;
       readClipboard(): Promise<string>;
       writeClipboard(text: string): Promise<void>;
       dispatch(message: import('@/lib/protocol').ControllerMessage): Promise<void>;

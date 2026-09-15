@@ -9,7 +9,6 @@ contextBridge.exposeInMainWorld('compCtrl', {
   verifyTrustedDevice: (deviceId, challenge, nonce, proof) => ipcRenderer.invoke('compctrl:verify-trusted-device', deviceId, challenge, nonce, proof),
   revokeTrustedDevice: (deviceId) => ipcRenderer.invoke('compctrl:revoke-trusted-device', deviceId),
   panicLockdown: () => ipcRenderer.invoke('compctrl:panic-lockdown'),
-  hideWindow: () => ipcRenderer.invoke('compctrl:hide-window'),
   readClipboard: () => ipcRenderer.invoke('compctrl:read-clipboard'),
   writeClipboard: (text) => ipcRenderer.invoke('compctrl:write-clipboard', text),
   dispatch: (message) => ipcRenderer.invoke('compctrl:dispatch', message),

@@ -645,11 +645,6 @@ function registerIpc() {
     panicLockdown();
   });
 
-  ipcMain.handle('compctrl:hide-window', (event) => {
-    assertTrustedIpc(event);
-    mainWindow?.hide();
-  });
-
   ipcMain.handle('compctrl:read-clipboard', (event) => {
     assertTrustedIpc(event);
     if (!settings.security.clipboardEnabled) throw new Error('Clipboard access is disabled.');
@@ -744,7 +739,11 @@ async function createWindow() {
       allowRunningInsecureContent: false,
     },
   });
-  mainWindow.setContentProtection(true);
+  // Do not enable BrowserWindow content protection here. On Windows it marks
+  // this process as excluded from capture, and some Chromium/Windows capture
+  // backends return an entirely black monitor stream when the same process is
+  // also the desktop capturer. Pairing details are hidden by the renderer as
+  // soon as a controller authenticates instead.
 
   mainWindow.on('close', (event) => {
     if (!isQuitting) {

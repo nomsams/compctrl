@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.0-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.1-x64.exe
 ```
 
 ## Controls
@@ -73,7 +73,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls. Trusted reconnect uses a rotating random 256-bit credential, encrypted at rest on Windows with `safeStorage`; a successfully used phone token immediately becomes invalid.
 - Sensitive features are least-privilege and controlled only from the Windows companion. Clipboard transfer, display power, Groq dictation, system audio, and restart/shutdown start disabled. Mouse and keyboard can be disabled while the live screen remains connected in view-only mode.
 - Only one recently active controller can hold a session. A second phone receives a busy response instead of displacing the first. **Emergency lockdown** (or **Ctrl+Alt+Shift+F11**) disconnects controllers, revokes every trusted phone, rotates the pairing and rendezvous identities, restores displays, releases held mouse/modifier buttons, and disables remote input.
-- The companion hides to the tray after authentication and marks its window as excluded from desktop capture, preventing active pairing details and local security settings from being exposed in the remote video. Permission changes and trusted-phone revocation are locked while a controller is connected.
+- The companion replaces its QR code and pairing details with a connected-session notice as soon as a phone authenticates. It deliberately remains visible because Windows capture-exclusion and hidden-window modes can produce black desktop frames on some systems. Permission changes and trusted-phone revocation are locked while a controller is connected.
 - The companion validates message shapes and sizes, caps clipboard text at 64 KiB, rate-limits authenticated controllers, limits audio uploads and Groq calls, rejects navigation/downloads in its renderer, and accepts native IPC only from the exact private loopback origin created for that launch. Packaged builds disable unsafe Electron runtime switches and validate the embedded ASAR before loading it.
 - WebRTC encrypts media and data in transit. The default public PeerJS signaling service can see connection metadata such as the temporary peer ID and IP addresses, but not decrypted screen or input data.
 - This build intentionally has no default TURN relay so the screen does not fall back to a third-party media server. A direct P2P route may fail on restrictive corporate, hotel, or carrier networks.

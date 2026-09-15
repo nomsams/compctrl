@@ -570,9 +570,6 @@ export function HostController() {
                 protocolVersion: PROTOCOL_VERSION,
                 capabilities,
               } satisfies HostMessage);
-              window.setTimeout(() => {
-                if (!disposed && connectionRef.current === incoming) void api.hideWindow();
-              }, 350);
             })().catch(() => {
               authenticationClaimed = false;
               incoming.close();
