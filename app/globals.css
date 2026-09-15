@@ -330,6 +330,13 @@ button, input { font: inherit; }
 .host-setting-row small { margin-top: .12rem; color: #87909b; font-size: .62rem; }
 .host-setting-icon { display: grid; width: 2.2rem; height: 2.2rem; place-items: center; border-radius: .62rem; background: rgba(49,94,251,.07); color: #315efb; }
 .host-setting-icon svg { width: .9rem; }
+.security-card .host-setting-row { cursor: default; }
+.security-lockdown { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-top: .8rem; border: 1px solid rgba(190,45,55,.2); border-radius: .8rem; background: rgba(225,77,85,.055); padding: .8rem; }
+.security-lockdown span { min-width: 0; }
+.security-lockdown strong, .security-lockdown small { display: block; }
+.security-lockdown strong { color: #982f38; font-size: .75rem; }
+.security-lockdown small { max-width: 36rem; margin-top: .18rem; color: #8b6870; font-size: .62rem; line-height: 1.45; }
+.security-lockdown button { flex: none; }
 .url-setting { display: flex; gap: .5rem; }
 .url-setting input { min-width: 0; flex: 1; }
 .host-note { display: flex; align-items: center; gap: .4rem; margin: .7rem .1rem 0; color: #89919d; font-size: .65rem; }
@@ -349,6 +356,10 @@ button, input { font: inherit; }
 .host-activity strong { font-size: .75rem; }
 .host-activity small { margin-top: .14rem; color: #818995; font-size: .64rem; }
 .host-activity > span:last-child { min-width: 0; }
+
+@media (max-width: 700px) {
+  .security-lockdown { align-items: stretch; flex-direction: column; }
+}
 
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes hint-away { to { opacity: 0; visibility: hidden; } }

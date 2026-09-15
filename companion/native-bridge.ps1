@@ -151,6 +151,17 @@ public static class CompCtrlNative
         PostMessage(new IntPtr(0xFFFF), 0x0112u, new IntPtr(0xF170), new IntPtr(off ? 2 : -1));
         if (!off) Jiggle();
     }
+
+    public static void ReleaseAll()
+    {
+        Button("left", false);
+        Button("right", false);
+        Button("middle", false);
+        Key("Control", false);
+        Key("Alt", false);
+        Key("Shift", false);
+        Key("Meta", false);
+    }
 }
 '@
 
@@ -196,6 +207,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             'text' { [CompCtrlNative]::Text([string]$message.text) }
             'jiggle' { [CompCtrlNative]::Jiggle() }
             'display-power' { [CompCtrlNative]::DisplayPower(([string]$message.state) -eq 'off') }
+            'release-all' { [CompCtrlNative]::ReleaseAll() }
         }
     }
     catch {

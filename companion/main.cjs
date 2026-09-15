@@ -21,6 +21,13 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const {
+  DEFAULT_SECURITY_SETTINGS,
+  TRUSTED_TOKEN_DELIVERY_GRACE_MS,
+  isTrustedDeviceFresh,
+  normalizeSecuritySettings,
+  trustedDeviceExpiry,
+} = require('./security.cjs');
 
 // Some Windows systems cannot start Electron's GPU subprocess (for example
 // after a graphics-driver update or on stripped-down/RDP sessions).  The host
@@ -55,6 +62,7 @@ let screenBlanked = false;
 let isQuitting = false;
 let transcriptionInProgress = false;
 let transcriptionTimes = [];
+let trustedRendererOrigin = '';
 
 function generateCode() {
   return Array.from(crypto.randomBytes(CODE_LENGTH), (byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
@@ -66,26 +74,33 @@ function generateTrustedPeerId() {
 
 function normalizeTrustedDevices(value) {
   if (!Array.isArray(value)) return [];
+  const now = Date.now();
   return value.slice(0, MAX_TRUSTED_DEVICES).flatMap((entry) => {
     if (
       !entry || typeof entry !== 'object'
       || typeof entry.id !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(entry.id)
       || typeof entry.tokenProtected !== 'string' || entry.tokenProtected.length > 1024
     ) return [];
-    return [{
+    const device = {
       id: entry.id,
       name: typeof entry.name === 'string' ? entry.name.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone' : 'Phone',
       tokenProtected: entry.tokenProtected,
       createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : Date.now(),
       lastSeenAt: Number.isFinite(entry.lastSeenAt) ? entry.lastSeenAt : Date.now(),
-    }];
+      expiresAt: trustedDeviceExpiry(entry),
+      previousTokenProtected: typeof entry.previousTokenProtected === 'string' && entry.previousTokenProtected.length <= 1024
+        ? entry.previousTokenProtected
+        : '',
+      previousTokenValidUntil: Number.isFinite(entry.previousTokenValidUntil) ? entry.previousTokenValidUntil : 0,
+    };
+    return isTrustedDeviceFresh(device, now) ? [device] : [];
   });
 }
 
 function trustedDeviceSummaries() {
   return [...(settings?.trustedDevices ?? [])]
     .sort((a, b) => b.lastSeenAt - a.lastSeenAt)
-    .map(({ id, name, createdAt, lastSeenAt }) => ({ id, name, createdAt, lastSeenAt }));
+    .map(({ id, name, createdAt, lastSeenAt, expiresAt }) => ({ id, name, createdAt, lastSeenAt, expiresAt }));
 }
 
 function settingsPath() {
@@ -101,6 +116,7 @@ function defaultSettings() {
     groqApiKeyProtected: '',
     trustedPeerId: generateTrustedPeerId(),
     trustedDevices: [],
+    security: { ...DEFAULT_SECURITY_SETTINGS },
   };
 }
 
@@ -122,6 +138,7 @@ function readSettings() {
         ? stored.trustedPeerId
         : defaults.trustedPeerId,
       trustedDevices: normalizeTrustedDevices(stored.trustedDevices),
+      security: normalizeSecuritySettings(stored.security),
     };
   } catch {
     return defaultSettings();
@@ -166,6 +183,10 @@ function readGroqApiKey() {
 }
 
 function issueTrustedDevice(deviceId, deviceName) {
+  if (!settings.security.trustedReconnectEnabled) {
+    throw new Error('Trusted reconnect is disabled in the companion.');
+  }
+  if (!settings.security.trustedReconnectEnabled) throw new Error('Trusted reconnect is disabled.');
   if (typeof deviceId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)) {
     throw new Error('The controller supplied an invalid device identity.');
   }
@@ -177,44 +198,78 @@ function issueTrustedDevice(deviceId, deviceName) {
     ? deviceName.replace(/[^\p{L}\p{N} ._'()-]/gu, '').slice(0, 48) || 'Phone'
     : 'Phone';
   const token = crypto.randomBytes(32).toString('base64url');
-  const existing = settings.trustedDevices.find((device) => device.id === deviceId);
   const nextDevice = {
     id: deviceId,
     name,
     tokenProtected: safeStorage.encryptString(token).toString('base64'),
-    createdAt: existing?.createdAt ?? now,
+    createdAt: now,
     lastSeenAt: now,
+    expiresAt: now + 30 * 24 * 60 * 60 * 1000,
+    previousTokenProtected: '',
+    previousTokenValidUntil: 0,
   };
   settings.trustedDevices = [
     nextDevice,
     ...settings.trustedDevices.filter((device) => device.id !== deviceId),
   ].slice(0, MAX_TRUSTED_DEVICES);
   writeSettings(settings);
-  return { deviceId, hostId: settings.trustedPeerId, token, devices: trustedDeviceSummaries() };
+  return { deviceId, hostId: settings.trustedPeerId, token, expiresAt: nextDevice.expiresAt, devices: trustedDeviceSummaries() };
 }
 
 function verifyTrustedDevice(deviceId, challenge, nonce, proof) {
+  if (!settings.security.trustedReconnectEnabled) return { ok: false, devices: trustedDeviceSummaries() };
+  if (!settings.security.trustedReconnectEnabled) return { ok: false, devices: trustedDeviceSummaries() };
   if (
     typeof deviceId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(deviceId)
     || typeof challenge !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(challenge)
     || typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(nonce)
     || typeof proof !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(proof)
-  ) return false;
+  ) return { ok: false, devices: trustedDeviceSummaries() };
   const device = settings.trustedDevices.find((candidate) => candidate.id === deviceId);
-  if (!device || !safeStorage.isEncryptionAvailable()) return false;
-  try {
-    const token = safeStorage.decryptString(Buffer.from(device.tokenProtected, 'base64'));
-    const expected = crypto.createHmac('sha256', token)
-      .update(`compctrl-trusted-v1:${challenge}:${nonce}`)
-      .digest('base64url');
-    const expectedBuffer = Buffer.from(expected);
-    const actualBuffer = Buffer.from(proof);
-    if (expectedBuffer.length !== actualBuffer.length || !crypto.timingSafeEqual(expectedBuffer, actualBuffer)) return false;
-    device.lastSeenAt = Date.now();
+  if (!device || !safeStorage.isEncryptionAvailable()) return { ok: false, devices: trustedDeviceSummaries() };
+  if (!isTrustedDeviceFresh(device)) {
+    settings.trustedDevices = settings.trustedDevices.filter((candidate) => candidate.id !== deviceId);
     writeSettings(settings);
-    return true;
+    return { ok: false, devices: trustedDeviceSummaries() };
+  }
+  try {
+    const actualBuffer = Buffer.from(proof);
+    const candidates = [device.tokenProtected];
+    if (device.previousTokenProtected && Date.now() <= device.previousTokenValidUntil) {
+      candidates.push(device.previousTokenProtected);
+    }
+    let matchedProtectedToken = '';
+    for (const protectedToken of candidates) {
+      const token = safeStorage.decryptString(Buffer.from(protectedToken, 'base64'));
+      const expected = crypto.createHmac('sha256', token)
+        .update(`compctrl-trusted-v1:${challenge}:${nonce}`)
+        .digest('base64url');
+      const expectedBuffer = Buffer.from(expected);
+      if (expectedBuffer.length === actualBuffer.length && crypto.timingSafeEqual(expectedBuffer, actualBuffer)) {
+        matchedProtectedToken = protectedToken;
+        break;
+      }
+    }
+    if (!matchedProtectedToken) {
+      return { ok: false, devices: trustedDeviceSummaries() };
+    }
+    const replacementToken = crypto.randomBytes(32).toString('base64url');
+    device.tokenProtected = safeStorage.encryptString(replacementToken).toString('base64');
+    device.previousTokenProtected = matchedProtectedToken;
+    device.previousTokenValidUntil = Date.now() + TRUSTED_TOKEN_DELIVERY_GRACE_MS;
+    device.lastSeenAt = Date.now();
+    device.expiresAt = trustedDeviceExpiry(device);
+    writeSettings(settings);
+    return {
+      ok: true,
+      deviceId,
+      hostId: settings.trustedPeerId,
+      token: replacementToken,
+      expiresAt: device.expiresAt,
+      devices: trustedDeviceSummaries(),
+    };
   } catch {
-    return false;
+    return { ok: false, devices: trustedDeviceSummaries() };
   }
 }
 
@@ -413,9 +468,42 @@ async function transcribeAudio(chunks, mimeType) {
 function isTrustedRendererUrl(value) {
   try {
     const url = new URL(value);
-    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+    return Boolean(trustedRendererOrigin) && url.origin === trustedRendererOrigin;
   } catch {
     return false;
+  }
+}
+
+function isAllowedExternalUrl(value) {
+  try {
+    const url = new URL(value);
+    if (url.origin === 'https://console.groq.com') return true;
+    const controller = new URL(settings.controllerUrl);
+    return url.origin === controller.origin && url.pathname.startsWith(controller.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function panicLockdown() {
+  if (!settings) return;
+  settings.security = { ...settings.security, remoteInputEnabled: false, trustedReconnectEnabled: false };
+  settings.trustedDevices = [];
+  settings.pairingCode = generateCode();
+  settings.trustedPeerId = generateTrustedPeerId();
+  settings.jigglerEnabled = false;
+  configureJiggler(false);
+  setScreenBlanked(false);
+  sendNative({ type: 'release-all' });
+  writeSettings(settings);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('compctrl:lockdown', {
+      pairingCode: settings.pairingCode,
+      trustedPeerId: settings.trustedPeerId,
+      security: settings.security,
+    });
+    mainWindow.show();
+    mainWindow.focus();
   }
 }
 
@@ -424,6 +512,7 @@ function updateTrayMenu() {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: 'Open CompCtrl', click: () => { mainWindow?.show(); mainWindow?.focus(); } },
     ...(screenBlanked ? [{ label: 'Turn local screens back on', click: () => setScreenBlanked(false) }] : []),
+    { label: 'Emergency lockdown', click: panicLockdown },
     { type: 'separator' },
     {
       label: 'Quit',
@@ -467,6 +556,7 @@ function registerIpc() {
       groqKeyConfigured: hasGroqApiKey(),
       trustedPeerId: settings.trustedPeerId,
       trustedDevices: trustedDeviceSummaries(),
+      security: settings.security,
       screenBlanked,
       computerName: os.hostname(),
       version: app.getVersion(),
@@ -491,13 +581,18 @@ function registerIpc() {
       next.autoStart = changes.autoStart;
       configureAutoStart(next.autoStart);
     }
+    if (changes?.security && typeof changes.security === 'object') {
+      next.security = normalizeSecuritySettings({ ...next.security, ...changes.security });
+      if (!next.security.trustedReconnectEnabled) next.trustedDevices = [];
+      if (!next.security.remoteInputEnabled) sendNative({ type: 'release-all' });
+    }
     settings = next;
     writeSettings(settings);
   });
 
   ipcMain.handle('compctrl:dispatch', (event, message) => {
     assertTrustedIpc(event);
-    if (isNativeMessage(message)) sendNative(message);
+    if (settings.security.remoteInputEnabled && isNativeMessage(message)) sendNative(message);
   });
 
   ipcMain.handle('compctrl:set-jiggler', (event, enabled) => {
@@ -516,7 +611,7 @@ function registerIpc() {
 
   ipcMain.handle('compctrl:system-action', (event, action) => {
     assertTrustedIpc(event);
-    if (action === 'restart' || action === 'shutdown') runSystemAction(action);
+    if (settings.security.powerActionsEnabled && (action === 'restart' || action === 'shutdown')) runSystemAction(action);
   });
 
   ipcMain.handle('compctrl:set-groq-api-key', (event, value) => {
@@ -526,6 +621,7 @@ function registerIpc() {
 
   ipcMain.handle('compctrl:transcribe-audio', (event, chunks, audioMimeType) => {
     assertTrustedIpc(event);
+    if (!settings.security.dictationEnabled) throw new Error('Voice dictation is disabled.');
     return transcribeAudio(chunks, audioMimeType);
   });
 
@@ -544,13 +640,25 @@ function registerIpc() {
     return revokeTrustedDevice(deviceId);
   });
 
+  ipcMain.handle('compctrl:panic-lockdown', (event) => {
+    assertTrustedIpc(event);
+    panicLockdown();
+  });
+
+  ipcMain.handle('compctrl:hide-window', (event) => {
+    assertTrustedIpc(event);
+    mainWindow?.hide();
+  });
+
   ipcMain.handle('compctrl:read-clipboard', (event) => {
     assertTrustedIpc(event);
+    if (!settings.security.clipboardEnabled) throw new Error('Clipboard access is disabled.');
     return clipboard.readText().slice(0, MAX_CLIPBOARD_TEXT_LENGTH);
   });
 
   ipcMain.handle('compctrl:write-clipboard', (event, value) => {
     assertTrustedIpc(event);
+    if (!settings.security.clipboardEnabled) throw new Error('Clipboard access is disabled.');
     if (typeof value !== 'string' || value.length > MAX_CLIPBOARD_TEXT_LENGTH) throw new Error('Clipboard text is too large.');
     clipboard.writeText(value);
   });
@@ -597,6 +705,8 @@ function startStaticServer() {
     );
     response.setHeader('X-Content-Type-Options', 'nosniff');
     response.setHeader('Referrer-Policy', 'no-referrer');
+    response.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    response.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
     fs.createReadStream(filePath).pipe(response);
   });
@@ -612,6 +722,7 @@ async function createWindow() {
   const rendererUrl = isDevelopment
     ? (process.env.ELECTRON_RENDERER_URL || 'http://localhost:3000/')
     : `http://127.0.0.1:${await startStaticServer()}/`;
+  trustedRendererOrigin = new URL(rendererUrl).origin;
 
   mainWindow = new BrowserWindow({
     width: 1040,
@@ -627,11 +738,13 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      devTools: isDevelopment,
       backgroundThrottling: false,
       webSecurity: true,
       allowRunningInsecureContent: false,
     },
   });
+  mainWindow.setContentProtection(true);
 
   mainWindow.on('close', (event) => {
     if (!isQuitting) {
@@ -640,7 +753,7 @@ async function createWindow() {
     }
   });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://') || url.startsWith('http://localhost')) void shell.openExternal(url);
+    if (isAllowedExternalUrl(url)) void shell.openExternal(url);
     return { action: 'deny' };
   });
   mainWindow.webContents.on('will-navigate', (event, url) => {
@@ -696,11 +809,11 @@ if (!app.requestSingleInstanceLock()) {
     }, { useSystemPicker: false });
     appSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
       const requestingUrl = details.requestingUrl || '';
-      callback(isTrustedRendererUrl(requestingUrl) && (permission === 'media' || permission === 'display-capture'));
+      callback(isTrustedRendererUrl(requestingUrl) && permission === 'display-capture');
     });
     appSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin, details) => {
       const requestingUrl = details?.requestingUrl || requestingOrigin || details?.securityOrigin || '';
-      return isTrustedRendererUrl(requestingUrl) && (permission === 'media' || permission === 'display-capture');
+      return isTrustedRendererUrl(requestingUrl) && permission === 'display-capture';
     });
 
     createTray();
@@ -711,6 +824,13 @@ if (!app.requestSingleInstanceLock()) {
     );
     if (!recoveryShortcutRegistered) {
       console.warn('The display recovery shortcut Ctrl+Alt+Shift+F12 is already in use.');
+    }
+    const lockdownShortcutRegistered = globalShortcut.register(
+      'CommandOrControl+Alt+Shift+F11',
+      panicLockdown,
+    );
+    if (!lockdownShortcutRegistered) {
+      console.warn('The emergency lockdown shortcut Ctrl+Alt+Shift+F11 is already in use.');
     }
   });
 }

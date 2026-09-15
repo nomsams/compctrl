@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('compCtrl', {
   issueTrustedDevice: (deviceId, deviceName) => ipcRenderer.invoke('compctrl:issue-trusted-device', deviceId, deviceName),
   verifyTrustedDevice: (deviceId, challenge, nonce, proof) => ipcRenderer.invoke('compctrl:verify-trusted-device', deviceId, challenge, nonce, proof),
   revokeTrustedDevice: (deviceId) => ipcRenderer.invoke('compctrl:revoke-trusted-device', deviceId),
+  panicLockdown: () => ipcRenderer.invoke('compctrl:panic-lockdown'),
+  hideWindow: () => ipcRenderer.invoke('compctrl:hide-window'),
   readClipboard: () => ipcRenderer.invoke('compctrl:read-clipboard'),
   writeClipboard: (text) => ipcRenderer.invoke('compctrl:write-clipboard', text),
   dispatch: (message) => ipcRenderer.invoke('compctrl:dispatch', message),
@@ -18,6 +20,11 @@ contextBridge.exposeInMainWorld('compCtrl', {
     const handler = (_event, enabled) => callback(Boolean(enabled));
     ipcRenderer.on('compctrl:display-state', handler);
     return () => ipcRenderer.removeListener('compctrl:display-state', handler);
+  },
+  onLockdown: (callback) => {
+    const handler = (_event, state) => callback(state);
+    ipcRenderer.on('compctrl:lockdown', handler);
+    return () => ipcRenderer.removeListener('compctrl:lockdown', handler);
   },
   onBeforeQuit: (callback) => {
     const handler = () => callback();

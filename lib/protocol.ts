@@ -9,6 +9,29 @@ export const MAX_CLIPBOARD_TEXT_LENGTH = 64 * 1024;
 export type PointerButton = 'left' | 'right' | 'middle';
 export type Modifier = 'Control' | 'Alt' | 'Shift' | 'Meta';
 
+export type SecuritySettings = {
+  remoteInputEnabled: boolean;
+  trustedReconnectEnabled: boolean;
+  clipboardEnabled: boolean;
+  powerActionsEnabled: boolean;
+  displayControlEnabled: boolean;
+  dictationEnabled: boolean;
+  systemAudioEnabled: boolean;
+};
+
+export type HostCapabilities = {
+  trustedReconnect: boolean;
+  clipboardText: boolean;
+  systemAudio: boolean;
+  remoteInput: boolean;
+  powerActions: boolean;
+  displayPower: boolean;
+  dictation: boolean;
+};
+
+export type AdvertisedHostCapabilities = Pick<HostCapabilities, 'trustedReconnect' | 'clipboardText' | 'systemAudio'>
+  & Partial<Pick<HostCapabilities, 'remoteInput' | 'powerActions' | 'displayPower' | 'dictation'>>;
+
 export type PointerMessage = {
   type: 'pointer';
   action: 'move' | 'down' | 'up' | 'click';
@@ -59,8 +82,8 @@ export type ControllerMessage =
 export type HostMessage =
   | { type: 'auth-challenge'; challenge: string }
   | { type: 'auth-ok' }
-  | { type: 'auth-rejected'; reason: 'trusted-device-revoked' | 'authentication-failed' }
-  | { type: 'trusted-credential'; deviceId: string; hostId: string; token: string }
+  | { type: 'auth-rejected'; reason: 'trusted-device-revoked' | 'authentication-failed' | 'session-busy' }
+  | { type: 'trusted-credential'; deviceId: string; hostId: string; token: string; expiresAt?: number }
   | {
     type: 'ready';
     computerName: string;
@@ -68,9 +91,9 @@ export type HostMessage =
     screenBlanked: boolean;
     dictationAvailable: boolean;
     protocolVersion?: number;
-    capabilities?: { trustedReconnect: boolean; clipboardText: boolean; systemAudio: boolean };
+    capabilities?: AdvertisedHostCapabilities;
   }
-  | { type: 'status'; jigglerEnabled: boolean; screenBlanked: boolean; dictationAvailable: boolean }
+  | { type: 'status'; jigglerEnabled: boolean; screenBlanked: boolean; dictationAvailable: boolean; capabilities?: AdvertisedHostCapabilities }
   | { type: 'clipboard-result'; requestId: string; action: 'read' | 'write'; ok: boolean; text?: string; message: string }
   | { type: 'dictation-status'; id: string; status: 'receiving' | 'transcribing' | 'done' | 'error'; message: string }
   | { type: 'pong'; sentAt: number }
@@ -221,11 +244,12 @@ export function isHostMessage(value: unknown): value is HostMessage {
   switch (value.type) {
     case 'auth-challenge': return typeof value.challenge === 'string' && tokenPattern.test(value.challenge);
     case 'auth-ok': return true;
-    case 'auth-rejected': return value.reason === 'trusted-device-revoked' || value.reason === 'authentication-failed';
+    case 'auth-rejected': return value.reason === 'trusted-device-revoked' || value.reason === 'authentication-failed' || value.reason === 'session-busy';
     case 'trusted-credential':
       return typeof value.deviceId === 'string' && tokenPattern.test(value.deviceId)
         && typeof value.hostId === 'string' && peerIdPattern.test(value.hostId)
-        && typeof value.token === 'string' && tokenPattern.test(value.token);
+        && typeof value.token === 'string' && tokenPattern.test(value.token)
+        && (value.expiresAt === undefined || (isFiniteNumber(value.expiresAt) && value.expiresAt > 0));
     case 'ready':
       return typeof value.computerName === 'string' && value.computerName.length <= 128
         && typeof value.jigglerEnabled === 'boolean' && typeof value.screenBlanked === 'boolean'
@@ -236,10 +260,24 @@ export function isHostMessage(value: unknown): value is HostMessage {
           && typeof value.capabilities.trustedReconnect === 'boolean'
           && typeof value.capabilities.clipboardText === 'boolean'
           && typeof value.capabilities.systemAudio === 'boolean'
+          && (value.capabilities.remoteInput === undefined || typeof value.capabilities.remoteInput === 'boolean')
+          && (value.capabilities.powerActions === undefined || typeof value.capabilities.powerActions === 'boolean')
+          && (value.capabilities.displayPower === undefined || typeof value.capabilities.displayPower === 'boolean')
+          && (value.capabilities.dictation === undefined || typeof value.capabilities.dictation === 'boolean')
         ));
     case 'status':
       return typeof value.jigglerEnabled === 'boolean' && typeof value.screenBlanked === 'boolean'
-        && typeof value.dictationAvailable === 'boolean';
+        && typeof value.dictationAvailable === 'boolean'
+        && (value.capabilities === undefined || (
+          isRecord(value.capabilities)
+          && typeof value.capabilities.trustedReconnect === 'boolean'
+          && typeof value.capabilities.clipboardText === 'boolean'
+          && typeof value.capabilities.systemAudio === 'boolean'
+          && (value.capabilities.remoteInput === undefined || typeof value.capabilities.remoteInput === 'boolean')
+          && (value.capabilities.powerActions === undefined || typeof value.capabilities.powerActions === 'boolean')
+          && (value.capabilities.displayPower === undefined || typeof value.capabilities.displayPower === 'boolean')
+          && (value.capabilities.dictation === undefined || typeof value.capabilities.dictation === 'boolean')
+        ));
     case 'clipboard-result':
       return typeof value.requestId === 'string' && tokenPattern.test(value.requestId)
         && (value.action === 'read' || value.action === 'write') && typeof value.ok === 'boolean'

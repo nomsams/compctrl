@@ -8,6 +8,7 @@ import {
   createPairingCode,
   isCompatibleProtocol,
   isControllerMessage,
+  isHostMessage,
   peerIdForCode,
 } from './protocol.ts';
 
@@ -55,4 +56,41 @@ void test('keeps protocol 2 screen sessions working during a protocol 3 rollout'
     nonce: 'qrstuvwxyzABCDEF',
     proof: 'proofProofProof12',
   }), true);
+  assert.equal(isHostMessage({
+    type: 'ready',
+    computerName: 'Older companion',
+    jigglerEnabled: false,
+    screenBlanked: false,
+    dictationAvailable: true,
+    protocolVersion: 3,
+    capabilities: { trustedReconnect: true, clipboardText: true, systemAudio: true },
+  }), true);
+});
+
+void test('validates security capability updates and busy-session rejection', () => {
+  const capabilities = {
+    trustedReconnect: true,
+    clipboardText: false,
+    systemAudio: false,
+    remoteInput: true,
+    powerActions: false,
+    displayPower: false,
+    dictation: false,
+  };
+  assert.equal(isHostMessage({
+    type: 'status',
+    jigglerEnabled: false,
+    screenBlanked: false,
+    dictationAvailable: false,
+    capabilities,
+  }), true);
+  assert.equal(isHostMessage({ type: 'auth-rejected', reason: 'session-busy' }), true);
+  assert.equal(isHostMessage({
+    type: 'trusted-credential',
+    deviceId: 'device_abcdefghijkl',
+    hostId: 'hostId_abcdefghijkl',
+    token: 'token_abcdefghijkl',
+    expiresAt: Date.now() + 60_000,
+  }), true);
+  assert.equal(isHostMessage({ type: 'status', jigglerEnabled: false, screenBlanked: false, dictationAvailable: false, capabilities: { ...capabilities, remoteInput: 'yes' } }), false);
 });

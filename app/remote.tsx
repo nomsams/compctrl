@@ -90,6 +90,7 @@ import {
   type ConnectionState,
   type ControllerMessage,
   type HostMessage,
+  type HostCapabilities,
   PROTOCOL_VERSION,
   authProofForCode,
   authProofForTrustedToken,
@@ -104,8 +105,31 @@ import {
 type Modifier = 'Control' | 'Alt' | 'Shift' | 'Meta';
 type DictationState = 'idle' | 'recording' | 'sending' | 'transcribing' | 'done' | 'error';
 type ClipboardResult = Extract<HostMessage, { type: 'clipboard-result' }>;
-type TrustedCredential = { version: 1; code: string; deviceId: string; hostId: string; token: string };
-type HostCapabilities = { trustedReconnect: boolean; clipboardText: boolean; systemAudio: boolean };
+type TrustedCredential = { version: 1; code: string; deviceId: string; hostId: string; token: string; expiresAt?: number };
+
+const NO_HOST_CAPABILITIES: HostCapabilities = {
+  trustedReconnect: false,
+  clipboardText: false,
+  systemAudio: false,
+  remoteInput: false,
+  powerActions: false,
+  displayPower: false,
+  dictation: false,
+};
+
+function normalizeHostCapabilities(value?: Extract<HostMessage, { type: 'ready' }>['capabilities']): HostCapabilities {
+  return {
+    trustedReconnect: value?.trustedReconnect ?? false,
+    clipboardText: value?.clipboardText ?? false,
+    systemAudio: value?.systemAudio ?? false,
+    // Protocol 2 and early protocol 3 companions predate fine-grained grants.
+    // Preserve their core controls; current companions always send explicit values.
+    remoteInput: value?.remoteInput ?? true,
+    powerActions: value?.powerActions ?? true,
+    displayPower: value?.displayPower ?? true,
+    dictation: value?.dictation ?? true,
+  };
+}
 
 type InstallPromptEvent = Event & {
   prompt(): Promise<void>;
@@ -202,16 +226,22 @@ function trustedStorageKey(code: string) {
 }
 
 function readTrustedCredential(code: string): TrustedCredential | null {
+  const storageKey = trustedStorageKey(code);
   try {
-    const value = JSON.parse(window.localStorage.getItem(trustedStorageKey(code)) ?? 'null') as Partial<TrustedCredential> | null;
+    const value = JSON.parse(window.localStorage.getItem(storageKey) ?? 'null') as Partial<TrustedCredential> | null;
     if (
       value?.version !== 1 || value.code !== cleanCode(code)
       || typeof value.deviceId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.deviceId)
       || typeof value.hostId !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.hostId)
       || typeof value.token !== 'string' || !/^[A-Za-z0-9_-]{16,128}$/.test(value.token)
-    ) return null;
+      || (value.expiresAt !== undefined && (!Number.isFinite(value.expiresAt) || value.expiresAt <= Date.now()))
+    ) {
+      window.localStorage.removeItem(storageKey);
+      return null;
+    }
     return value as TrustedCredential;
   } catch {
+    window.localStorage.removeItem(storageKey);
     return null;
   }
 }
@@ -248,7 +278,7 @@ export function RemoteController() {
   const [trustedDevice, setTrustedDevice] = useState(false);
   const [clipboardResult, setClipboardResult] = useState<ClipboardResult | null>(null);
   const [systemAudioEnabled, setSystemAudioEnabled] = useState(false);
-  const [hostCapabilities, setHostCapabilities] = useState<HostCapabilities>({ trustedReconnect: false, clipboardText: false, systemAudio: false });
+  const [hostCapabilities, setHostCapabilities] = useState<HostCapabilities>(NO_HOST_CAPABILITIES);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent | null>(null);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [scannerStatus, setScannerStatus] = useState('Starting camera…');
@@ -265,6 +295,7 @@ export function RemoteController() {
   const dictationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deviceIdRef = useRef('');
   const systemAudioEnabledRef = useRef(false);
+  const hostCapabilitiesRef = useRef<HostCapabilities>(NO_HOST_CAPABILITIES);
 
   useEffect(() => {
     deviceIdRef.current = getOrCreateDeviceId();
@@ -475,6 +506,18 @@ export function RemoteController() {
     }
     setTrustedDevice(Boolean(trustedCredential));
 
+    const cancelRevokedDictation = () => {
+      const recorder = recorderRef.current;
+      if (recorder?.state === 'recording') {
+        recorder.onstop = null;
+        recorder.stop();
+      }
+      recorderRef.current = null;
+      stopRecorderTracks();
+      setDictationState('idle');
+      setDictationMessage('Voice dictation was disabled on the computer.');
+    };
+
     const cleanTransport = () => {
       const recorder = recorderRef.current;
       if (recorder?.state === 'recording') {
@@ -485,7 +528,8 @@ export function RemoteController() {
       stopRecorderTracks();
       setDictationState('idle');
       setDictationAvailable(false);
-      setHostCapabilities({ trustedReconnect: false, clipboardText: false, systemAudio: false });
+      hostCapabilitiesRef.current = NO_HOST_CAPABILITIES;
+      setHostCapabilities(NO_HOST_CAPABILITIES);
       connection?.close();
       const activeCall = callRef.current;
       callRef.current = null;
@@ -569,6 +613,11 @@ export function RemoteController() {
               return;
             }
             if (message.type === 'auth-rejected') {
+              if (message.reason === 'session-busy') {
+                setHostNotice('Another phone is actively connected. Retrying when that session ends…');
+                connection?.close();
+                return;
+              }
               if (authMode === 'trusted') {
                 window.localStorage.removeItem(trustedStorageKey(sessionCode));
                 trustedCredential = null;
@@ -599,12 +648,18 @@ export function RemoteController() {
             }
             if (message.type === 'trusted-credential') {
               if (message.deviceId !== deviceIdRef.current) return;
+              if (trustedCredential && message.hostId !== trustedCredential.hostId) {
+                setHostNotice('Blocked an unexpected trusted-computer identity change. Re-scan the computer QR code to approve it.');
+                connection?.close();
+                return;
+              }
               trustedCredential = {
                 version: 1,
                 code: sessionCode,
                 deviceId: message.deviceId,
                 hostId: message.hostId,
                 token: message.token,
+                expiresAt: message.expiresAt,
               };
               window.localStorage.setItem(trustedStorageKey(sessionCode), JSON.stringify(trustedCredential));
               setTrustedDevice(true);
@@ -617,19 +672,29 @@ export function RemoteController() {
             if (message.type === 'ready') {
               setComputerName(message.computerName);
               setJigglerEnabled(message.jigglerEnabled);
-              setDictationAvailable(message.dictationAvailable);
-              const supported = typeof message.screenBlanked === 'boolean';
+              const capabilities = normalizeHostCapabilities(message.capabilities);
+              hostCapabilitiesRef.current = capabilities;
+              setHostCapabilities(capabilities);
+              setDictationAvailable(message.dictationAvailable && capabilities.dictation);
+              if (!capabilities.dictation) cancelRevokedDictation();
+              const supported = capabilities.displayPower;
               setDisplayControlSupported(supported);
               setScreenBlanked(supported && message.screenBlanked);
-              setHostCapabilities(message.capabilities ?? { trustedReconnect: false, clipboardText: false, systemAudio: false });
               setHostNotice('Connected. Starting desktop video…');
               if (!callRef.current) send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current });
             } else if (message.type === 'status') {
               setJigglerEnabled(message.jigglerEnabled);
-              setDictationAvailable(message.dictationAvailable);
+              if (message.capabilities) {
+                const capabilities = normalizeHostCapabilities(message.capabilities);
+                hostCapabilitiesRef.current = capabilities;
+                setHostCapabilities(capabilities);
+              }
+              const capabilities = message.capabilities ? normalizeHostCapabilities(message.capabilities) : hostCapabilitiesRef.current;
+              setDictationAvailable(message.dictationAvailable && capabilities.dictation);
+              if (!capabilities.dictation) cancelRevokedDictation();
+              setDisplayControlSupported(capabilities.displayPower);
               if (typeof message.screenBlanked === 'boolean') {
-                setDisplayControlSupported(true);
-                setScreenBlanked(message.screenBlanked);
+                setScreenBlanked(capabilities.displayPower && message.screenBlanked);
               }
             } else if (message.type === 'pong') {
               lastPongRef.current = Date.now();
@@ -835,6 +900,7 @@ export function RemoteController() {
         }}
         jigglerEnabled={jigglerEnabled}
         setJigglerEnabled={(enabled) => {
+          if (!hostCapabilities.remoteInput) return;
           setJigglerEnabled(enabled);
           send({ type: 'jiggler', enabled });
         }}
@@ -845,7 +911,7 @@ export function RemoteController() {
         dictationMessage={dictationMessage}
         toggleDictation={toggleDictation}
         setScreenBlanked={(blanked) => {
-          if (!displayControlSupported) return;
+          if (!displayControlSupported || !hostCapabilities.displayPower) return;
           setScreenBlanked(blanked);
           send({ type: 'display', blanked });
         }}
@@ -1170,8 +1236,9 @@ function RemoteSurface({
   }, []);
 
   const sendPointerAt = useCallback((action: 'move' | 'down' | 'up' | 'click', point: RemotePoint, button: 'left' | 'right' | 'middle' = 'left') => {
+    if (connectionState !== 'connected' || !hostCapabilities.remoteInput) return;
     send({ type: 'pointer', action, x: point.x, y: point.y, button });
-  }, [send]);
+  }, [connectionState, hostCapabilities.remoteInput, send]);
 
   const moveCursor = useCallback((point: RemotePoint) => {
     const next = clampPoint(point);
@@ -1398,6 +1465,7 @@ function RemoteSurface({
   }, [magnifierVisible]);
 
   const handleHardwareKey = (event: ReactKeyboardEvent<HTMLButtonElement>, action: 'down' | 'up') => {
+    if (!hostCapabilities.remoteInput) return;
     if (event.nativeEvent.isComposing || event.key === 'Unidentified') return;
     event.preventDefault();
     send({ type: 'key', action: event.repeat ? 'tap' : action, key: event.key });
@@ -1509,7 +1577,7 @@ function RemoteSurface({
       } else if (multi.mode === 'scroll') {
         const deltaX = (multi.lastMidpoint.x - midpoint.x) * 1.35;
         const deltaY = (multi.lastMidpoint.y - midpoint.y) * 2.2;
-        if (Math.abs(deltaX) > 0.4 || Math.abs(deltaY) > 0.4) send({ type: 'wheel', deltaX, deltaY });
+        if (hostCapabilities.remoteInput && (Math.abs(deltaX) > 0.4 || Math.abs(deltaY) > 0.4)) send({ type: 'wheel', deltaX, deltaY });
       }
       multi.lastMidpoint = midpoint;
       return;
@@ -1606,6 +1674,7 @@ function RemoteSurface({
   };
 
   const tapVirtualKey = (key: string) => {
+    if (!hostCapabilities.remoteInput) return;
     if (['Control', 'Alt', 'Shift', 'Meta'].includes(key)) {
       toggleModifier(key as Modifier);
       return;
@@ -1615,6 +1684,7 @@ function RemoteSurface({
   };
 
   const relayInputValue = (input: HTMLInputElement) => {
+    if (!hostCapabilities.remoteInput) return;
     const previous = inputHistoryRef.current.get(input) ?? '';
     const next = input.value;
     if (previous === next) return;
@@ -1743,6 +1813,7 @@ function RemoteSurface({
   };
 
   const connected = connectionState === 'connected';
+  const inputAllowed = connected && hostCapabilities.remoteInput;
   const dictationBusy = dictationState === 'sending' || dictationState === 'transcribing';
   const dictationLabel = dictationState === 'recording' ? 'Stop' : dictationBusy ? 'Wait' : 'Voice';
   const statusText = connected
@@ -1805,7 +1876,7 @@ function RemoteSurface({
             style={videoStyle}
             onLoadedMetadata={measureStage}
           />
-          {stream && cursorVisible && (
+          {stream && cursorVisible && hostCapabilities.remoteInput && (
             <span
               className={`remote-cursor ${magnifierOpen ? 'is-precision' : ''}`}
               style={{ left: `${cursorDisplay.x * 100}%`, top: `${cursorDisplay.y * 100}%` }}
@@ -1832,7 +1903,7 @@ function RemoteSurface({
         )}
         {stream && (
           <span className="touch-hint">
-            {pointerMode === 'touchpad' ? 'Swipe to move' : 'Touch to position'} · Two fingers: tap middle-click, swipe scroll · Pinch zoom
+            {hostCapabilities.remoteInput ? `${pointerMode === 'touchpad' ? 'Swipe to move' : 'Touch to position'} · Two fingers: tap middle-click, swipe scroll · Pinch zoom` : 'View-only mode · enable mouse and keyboard on the computer'}
           </span>
         )}
         </button>
@@ -1850,7 +1921,7 @@ function RemoteSurface({
             <ZoomOut /> {view.scale.toFixed(1)}× · Reset
           </button>
         )}
-        {screenBlanked && (
+        {screenBlanked && displayControlSupported && (
           <button type="button" className="screen-blank-chip" onClick={() => setScreenBlanked(false)}>
             <EyeOff /> Displays off <small>Turn on</small>
           </button>
@@ -1859,7 +1930,7 @@ function RemoteSurface({
           type="button"
           className={`app-switcher-button ${screenBlanked ? 'is-lowered' : ''}`}
           onClick={() => send({ type: 'key', action: 'tap', key: 'Tab', modifiers: ['Meta'] })}
-          disabled={!connected}
+          disabled={!inputAllowed}
           aria-label="Open Windows task view"
         >
           <PanelsTopLeft /><span>Apps</span>
@@ -1872,23 +1943,23 @@ function RemoteSurface({
         <div className={`scroll-buttons ${immersive ? 'has-clicks' : ''}`} aria-label="Pointer and scroll controls">
           {immersive && (
             <>
-              <button type="button" className="is-primary" onClick={() => sendPointer('click')} disabled={!connected} aria-label="Left click">
+              <button type="button" className="is-primary" onClick={() => sendPointer('click')} disabled={!inputAllowed} aria-label="Left click">
                 <MousePointerClick /><span>Left</span>
               </button>
-              <button type="button" onClick={() => sendPointer('click', 'right')} disabled={!connected} aria-label="Right click">
+              <button type="button" onClick={() => sendPointer('click', 'right')} disabled={!inputAllowed} aria-label="Right click">
                 <MousePointer2 /><span>Right</span>
               </button>
             </>
           )}
-          <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: -360 })} disabled={!connected} aria-label="Scroll up">
+          <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: -360 })} disabled={!inputAllowed} aria-label="Scroll up">
             <ChevronUp /><span>Up</span>
           </button>
-          <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: 360 })} disabled={!connected} aria-label="Scroll down">
+          <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: 360 })} disabled={!inputAllowed} aria-label="Scroll down">
             <ChevronDown /><span>Down</span>
           </button>
           {immersive && (
             <>
-              <button type="button" onClick={() => send({ type: 'key', action: 'tap', key: 'Enter' })} disabled={!connected} aria-label="Press Enter">
+              <button type="button" onClick={() => send({ type: 'key', action: 'tap', key: 'Enter' })} disabled={!inputAllowed} aria-label="Press Enter">
                 <CornerDownLeft /><span>Enter</span>
               </button>
               <button type="button" className={dictationState === 'recording' ? 'is-recording' : ''} onClick={toggleDictation} disabled={!connected || !dictationAvailable || dictationBusy} aria-label={dictationState === 'recording' ? 'Stop and transcribe voice recording' : 'Start voice dictation'}>
@@ -1900,19 +1971,19 @@ function RemoteSurface({
       </div>
 
       <nav className="remote-toolbar" aria-label="Remote control shortcuts">
-        <Button className="shortcut-button" onClick={() => send({ type: 'key', action: 'tap', key: 'c', modifiers: ['Control'] })}>
+        <Button className="shortcut-button" disabled={!inputAllowed} onClick={() => send({ type: 'key', action: 'tap', key: 'c', modifiers: ['Control'] })}>
           <Copy /><span><small>Ctrl</small>C</span>
         </Button>
-        <Button className="shortcut-button" onClick={() => send({ type: 'key', action: 'tap', key: 'v', modifiers: ['Control'] })}>
+        <Button className="shortcut-button" disabled={!inputAllowed} onClick={() => send({ type: 'key', action: 'tap', key: 'v', modifiers: ['Control'] })}>
           <Clipboard /><span><small>Ctrl</small>V</span>
         </Button>
-        <Button variant="secondary" className="toolbar-button" onClick={openPhoneKeyboard}>
+        <Button variant="secondary" className="toolbar-button" disabled={!inputAllowed} onClick={openPhoneKeyboard}>
           <Keyboard /><span>{keyboardPanelEnabled ? 'PC keys' : 'Type'}</span>
         </Button>
-        <Button variant="secondary" className="toolbar-button" onClick={() => sendPointer('click')}>
+        <Button variant="secondary" className="toolbar-button" disabled={!inputAllowed} onClick={() => sendPointer('click')}>
           <MousePointerClick /><span>Click</span>
         </Button>
-        <Button variant="secondary" className="toolbar-button" onClick={() => sendPointer('click', 'right')}>
+        <Button variant="secondary" className="toolbar-button" disabled={!inputAllowed} onClick={() => sendPointer('click', 'right')}>
           <MousePointer2 /><span>Right</span>
         </Button>
         <Button variant="secondary" className={`toolbar-button ${dictationState === 'recording' ? 'is-recording' : ''}`} onClick={toggleDictation} disabled={!connected || !dictationAvailable || dictationBusy}>
@@ -2111,6 +2182,13 @@ function RemoteSurface({
               />
             </div>
             <div className="control-section-label">Pointer</div>
+            {!hostCapabilities.remoteInput && (
+              <div className="control-row">
+                <span className="control-row-icon danger"><ShieldCheck /></span>
+                <span><strong>View-only mode</strong><small>Mouse and keyboard are blocked by the Windows companion</small></span>
+                <ShieldCheck className="text-emerald-400" />
+              </div>
+            )}
             <div className="control-row">
               <span className="control-row-icon"><Hand /></span>
               <span><strong>Touchpad mode</strong><small>Swipe anywhere to move the pointer relatively</small></span>
@@ -2193,7 +2271,7 @@ function RemoteSurface({
               <span className="control-row-icon"><EyeOff /></span>
               <span>
                 <strong>Power local displays off</strong>
-                <small>{displayControlSupported ? 'Hardware power-off · kept off after remote input' : 'Install the latest Windows companion to enable'}</small>
+                <small>{displayControlSupported ? 'Hardware power-off · kept off after remote input' : 'Disabled by the Windows companion'}</small>
               </span>
               <Switch
                 checked={screenBlanked}
@@ -2205,12 +2283,12 @@ function RemoteSurface({
             <div className="control-row">
               <span className="control-row-icon safe"><Gauge /></span>
               <span><strong>Screen jiggler</strong><small>Move the pointer slightly every 30 seconds</small></span>
-              <Switch checked={jigglerEnabled} onCheckedChange={setJigglerEnabled} aria-label="Toggle screen jiggler" />
+              <Switch checked={jigglerEnabled} disabled={!hostCapabilities.remoteInput} onCheckedChange={setJigglerEnabled} aria-label="Toggle screen jiggler" />
             </div>
-            <button type="button" className="control-row" onClick={() => setPowerAction('restart')}>
+            <button type="button" className="control-row" disabled={!hostCapabilities.powerActions} onClick={() => setPowerAction('restart')}>
               <span className="control-row-icon"><RotateCcw /></span><span><strong>Restart computer</strong><small>Requires a hold to confirm</small></span><ArrowRight />
             </button>
-            <button type="button" className="control-row danger" onClick={() => setPowerAction('shutdown')}>
+            <button type="button" className="control-row danger" disabled={!hostCapabilities.powerActions} onClick={() => setPowerAction('shutdown')}>
               <span className="control-row-icon danger"><Power /></span><span><strong>Shut down computer</strong><small>Requires a hold to confirm</small></span><ArrowRight />
             </button>
             <button type="button" className="control-row" onClick={disconnect}>

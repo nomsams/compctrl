@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.3.1-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.0-x64.exe
 ```
 
 ## Controls
@@ -61,7 +61,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - **Computer audio** can add Windows system sound to the P2P screen stream. It starts off for every new controller session and is enabled explicitly from session controls.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
 - **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
-- The first successful code connection creates a high-entropy per-device credential. Trusted phones reconnect through a separate stable rendezvous identity; the companion lists every trusted phone and can revoke one at any time. Revocation also rotates the temporary pairing code.
+- If **Remember trusted phones** is enabled on Windows, the first successful code connection creates a high-entropy per-device credential. It rotates after every reconnect, expires after 30 days or 7 inactive days, and can be revoked locally. The temporary QR/code becomes single-use for modern controllers.
 - A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active computer across a page reload. Disconnecting manually disables auto-reconnect without revoking the phone.
 - Screen capture has its own recovery path: the phone reports the companion's capture status, retries stalled video automatically, and provides a **Retry screen** button without disconnecting mouse or keyboard control.
 - Protocol 3 keeps screen/control compatibility with protocol 2 during staged upgrades. A new phone controller automatically retries the previous protocol, and a new companion accepts the previous published controller, preventing a cached or not-yet-deployed page from becoming a black screen.
@@ -70,14 +70,18 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 ## Security and network notes
 
 - The Windows companion is required. Normal web pages are deliberately prevented from controlling the operating system or capturing the desktop unattended.
-- Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls. Trusted reconnect uses its own random 256-bit credential, encrypted at rest on Windows with `safeStorage`; only a revocable copy in that phone's browser storage can answer the trusted-device challenge.
-- The companion validates message shapes and sizes, caps clipboard text at 64 KiB, rate-limits authenticated controllers, limits audio uploads and Groq calls, rejects navigation/downloads in its renderer, and accepts native IPC only from its private loopback page.
+- Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls. Trusted reconnect uses a rotating random 256-bit credential, encrypted at rest on Windows with `safeStorage`; a successfully used phone token immediately becomes invalid.
+- Sensitive features are least-privilege and controlled only from the Windows companion. Clipboard transfer, display power, Groq dictation, system audio, and restart/shutdown start disabled. Mouse and keyboard can be disabled while the live screen remains connected in view-only mode.
+- Only one recently active controller can hold a session. A second phone receives a busy response instead of displacing the first. **Emergency lockdown** (or **Ctrl+Alt+Shift+F11**) disconnects controllers, revokes every trusted phone, rotates the pairing and rendezvous identities, restores displays, releases held mouse/modifier buttons, and disables remote input.
+- The companion hides to the tray after authentication and marks its window as excluded from desktop capture, preventing active pairing details and local security settings from being exposed in the remote video. Permission changes and trusted-phone revocation are locked while a controller is connected.
+- The companion validates message shapes and sizes, caps clipboard text at 64 KiB, rate-limits authenticated controllers, limits audio uploads and Groq calls, rejects navigation/downloads in its renderer, and accepts native IPC only from the exact private loopback origin created for that launch. Packaged builds disable unsafe Electron runtime switches and validate the embedded ASAR before loading it.
 - WebRTC encrypts media and data in transit. The default public PeerJS signaling service can see connection metadata such as the temporary peer ID and IP addresses, but not decrypted screen or input data.
 - This build intentionally has no default TURN relay so the screen does not fall back to a third-party media server. A direct P2P route may fail on restrictive corporate, hotel, or carrier networks.
 - The native bridge accepts commands only through Electron IPC; it does not open a local TCP port. Restart and shutdown are unavailable until a paired WebRTC data channel is open, and the phone UI requires a press-and-hold confirmation.
 - The Groq key is encrypted with Electron `safeStorage` (Windows DPAPI) and is never returned to the phone or page. Dictation audio does leave the P2P session: the companion sends it over HTTPS to Groq for transcription. No Groq key is included in this repository or any build.
 - Packaged companions verify the native bridge and bundled web assets against a SHA-256 manifest embedded inside the application before starting. Release checksums detect a damaged or substituted download, but they are not a substitute for code signing and cannot defend against an attacker who controls both the release account and its published hashes.
 - No remote-control application can remain trustworthy after an attacker gains administrator-level control of the Windows account or modifies the running operating system. The controls above are intended to prevent guessing, replay, malformed-message abuse, and accidental package corruption—not to claim protection from a fully compromised endpoint.
+- A compromised phone that is currently authorized for mouse and keyboard can act with the privileges of the signed-in Windows user. Keep dangerous permission switches off until needed, use a non-administrator Windows account for remote sessions, and trigger emergency lockdown locally if a controller behaves unexpectedly.
 - Display-off state is deliberately not saved across a companion restart. Windows normally wakes powered-off displays on injected input, so CompCtrl sends the native off command again while this mode remains enabled. Some display drivers may pause desktop capture while their panel is powered down.
 
 ## Project layout

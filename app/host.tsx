@@ -15,6 +15,7 @@ import {
   MonitorUp,
   MousePointer2,
   RefreshCw,
+  ShieldAlert,
   ShieldCheck,
   Smartphone,
   Trash2,
@@ -30,6 +31,8 @@ import { newPeer } from '@/lib/peer';
 import {
   type ControllerMessage,
   type HostMessage,
+  type HostCapabilities,
+  type SecuritySettings,
   CODE_LENGTH,
   PROTOCOL_VERSION,
   authProofForCode,
@@ -42,6 +45,28 @@ import {
 } from '@/lib/protocol';
 
 type HostState = 'starting' | 'ready' | 'connected' | 'reconnecting' | 'error';
+
+const DEFAULT_SECURITY_SETTINGS: SecuritySettings = {
+  remoteInputEnabled: true,
+  trustedReconnectEnabled: true,
+  clipboardEnabled: false,
+  powerActionsEnabled: false,
+  displayControlEnabled: false,
+  dictationEnabled: false,
+  systemAudioEnabled: false,
+};
+
+function capabilitiesFor(settings: SecuritySettings): HostCapabilities {
+  return {
+    trustedReconnect: settings.trustedReconnectEnabled,
+    clipboardText: settings.clipboardEnabled,
+    systemAudio: settings.systemAudioEnabled,
+    remoteInput: settings.remoteInputEnabled,
+    powerActions: settings.powerActionsEnabled,
+    displayPower: settings.displayControlEnabled,
+    dictation: settings.dictationEnabled,
+  };
+}
 
 function normalizeControllerUrl(value: string) {
   const trimmed = value.trim();
@@ -71,12 +96,14 @@ export function HostController() {
   const [autoStart, setAutoStart] = useState(true);
   const [groqKeyConfigured, setGroqKeyConfigured] = useState(false);
   const [groqKeyDraft, setGroqKeyDraft] = useState('');
+  const [security, setSecurity] = useState<SecuritySettings>(DEFAULT_SECURITY_SETTINGS);
   const [controllerName, setControllerName] = useState('Phone');
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState('Starting secure session…');
   const jigglerRef = useRef(false);
   const screenBlankedRef = useRef(false);
   const groqKeyConfiguredRef = useRef(false);
+  const securityRef = useRef<SecuritySettings>(DEFAULT_SECURITY_SETTINGS);
   const dictationsRef = useRef(new Map<string, { mimeType: string; chunks: Map<number, string>; encodedBytes: number }>());
   const connectionRef = useRef<DataConnection | null>(null);
   const callRef = useRef<MediaConnection | null>(null);
@@ -87,6 +114,8 @@ export function HostController() {
   const capturePendingRef = useRef(false);
   const requestedSystemAudioRef = useRef(false);
   const connectedDeviceIdRef = useRef('');
+  const lastAuthenticatedActivityRef = useRef(0);
+  const pendingPairingCodeRef = useRef('');
 
   const stopStream = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
@@ -99,6 +128,7 @@ export function HostController() {
   useEffect(() => { jigglerRef.current = jigglerEnabled; }, [jigglerEnabled]);
   useEffect(() => { screenBlankedRef.current = screenBlanked; }, [screenBlanked]);
   useEffect(() => { groqKeyConfiguredRef.current = groqKeyConfigured; }, [groqKeyConfigured]);
+  useEffect(() => { securityRef.current = security; }, [security]);
 
   useEffect(() => {
     if (!pairingCode) {
@@ -115,6 +145,17 @@ export function HostController() {
     if (connectionRef.current?.open) void connectionRef.current.send(message);
   }, []);
 
+  const sendStatus = useCallback(() => {
+    const capabilities = capabilitiesFor(securityRef.current);
+    send({
+      type: 'status',
+      jigglerEnabled: jigglerRef.current,
+      screenBlanked: screenBlankedRef.current,
+      dictationAvailable: groqKeyConfiguredRef.current && capabilities.dictation,
+      capabilities,
+    });
+  }, [send]);
+
   const handleControllerMessage = useCallback(async (message: ControllerMessage) => {
     if (!api) return;
     if (message.type === 'ping') {
@@ -122,20 +163,25 @@ export function HostController() {
       return;
     }
     if (message.type === 'jiggler') {
+      if (!securityRef.current.remoteInputEnabled) return;
       await api.setJiggler(message.enabled);
       setJigglerEnabled(message.enabled);
-      send({ type: 'status', jigglerEnabled: message.enabled, screenBlanked: screenBlankedRef.current, dictationAvailable: groqKeyConfiguredRef.current });
+      sendStatus();
       return;
     }
     if (message.type === 'display') {
+      if (!securityRef.current.displayControlEnabled) {
+        send({ type: 'notice', message: 'Display control is disabled on the computer.' });
+        return;
+      }
       const blanked = await api.setDisplayBlanked(message.blanked);
       setScreenBlanked(blanked);
       setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
-      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked, dictationAvailable: groqKeyConfiguredRef.current });
+      sendStatus();
       return;
     }
     if (message.type === 'dictation-start') {
-      if (!groqKeyConfiguredRef.current) {
+      if (!securityRef.current.dictationEnabled || !groqKeyConfiguredRef.current) {
         send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Add a Groq API key in the Windows companion first.' });
         return;
       }
@@ -145,6 +191,7 @@ export function HostController() {
       return;
     }
     if (message.type === 'dictation-chunk') {
+      if (!securityRef.current.dictationEnabled) return;
       const recording = dictationsRef.current.get(message.id);
       if (!recording || recording.chunks.has(message.index)) return;
       recording.encodedBytes += message.data.length;
@@ -157,6 +204,7 @@ export function HostController() {
       return;
     }
     if (message.type === 'dictation-end') {
+      if (!securityRef.current.dictationEnabled) return;
       const recording = dictationsRef.current.get(message.id);
       if (!recording || recording.chunks.size !== message.totalChunks) {
         dictationsRef.current.delete(message.id);
@@ -186,11 +234,17 @@ export function HostController() {
       return;
     }
     if (message.type === 'stream') {
-      if (typeof message.systemAudio === 'boolean') requestedSystemAudioRef.current = message.systemAudio;
+      if (typeof message.systemAudio === 'boolean') {
+        requestedSystemAudioRef.current = message.systemAudio && securityRef.current.systemAudioEnabled;
+      }
       await shareScreenRef.current?.();
       return;
     }
     if (message.type === 'clipboard-read') {
+      if (!securityRef.current.clipboardEnabled) {
+        send({ type: 'clipboard-result', requestId: message.requestId, action: 'read', ok: false, message: 'Clipboard access is disabled on the computer.' });
+        return;
+      }
       try {
         const text = await api.readClipboard();
         send({ type: 'clipboard-result', requestId: message.requestId, action: 'read', ok: true, text, message: text ? 'Computer clipboard received.' : 'The computer clipboard is empty.' });
@@ -200,6 +254,10 @@ export function HostController() {
       return;
     }
     if (message.type === 'clipboard-write') {
+      if (!securityRef.current.clipboardEnabled) {
+        send({ type: 'clipboard-result', requestId: message.requestId, action: 'write', ok: false, message: 'Clipboard access is disabled on the computer.' });
+        return;
+      }
       try {
         await api.writeClipboard(message.text);
         send({ type: 'clipboard-result', requestId: message.requestId, action: 'write', ok: true, message: 'Phone text copied to the computer clipboard.' });
@@ -209,11 +267,16 @@ export function HostController() {
       return;
     }
     if (message.type === 'system') {
+      if (!securityRef.current.powerActionsEnabled) {
+        send({ type: 'notice', message: 'Restart and shutdown are disabled on the computer.' });
+        return;
+      }
       await api.systemAction(message.action);
       return;
     }
+    if (!securityRef.current.remoteInputEnabled) return;
     await api.dispatch(message);
-  }, [api, send]);
+  }, [api, send, sendStatus]);
 
   useEffect(() => {
     if (!api) return;
@@ -232,6 +295,8 @@ export function HostController() {
       setGroqKeyConfigured(settings.groqKeyConfigured);
       setTrustedPeerId(settings.trustedPeerId);
       setTrustedDevices(settings.trustedDevices);
+      setSecurity(settings.security);
+      securityRef.current = settings.security;
       void api.saveSettings({ pairingCode: code });
     });
     return () => { disposed = true; };
@@ -242,9 +307,23 @@ export function HostController() {
     return api.onDisplayState((blanked) => {
       setScreenBlanked(blanked);
       setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
-      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked, dictationAvailable: groqKeyConfiguredRef.current });
+      sendStatus();
     });
-  }, [api, send]);
+  }, [api, sendStatus]);
+
+  useEffect(() => {
+    if (!api) return;
+    return api.onLockdown((state) => {
+      securityRef.current = state.security;
+      setSecurity(state.security);
+      setTrustedDevices([]);
+      setPairingCode(state.pairingCode);
+      setTrustedPeerId(state.trustedPeerId);
+      setJigglerEnabled(false);
+      connectionRef.current?.close();
+      setNotice('Emergency lockdown active — all phones revoked and remote input disabled');
+    });
+  }, [api]);
 
   useEffect(() => {
     if (!api || !pairingCode || !hostPeerId || !trustedPeerId) return;
@@ -252,6 +331,7 @@ export function HostController() {
     let pairingPeer: ReturnType<typeof newPeer> | null = null;
     let trustedPeer: ReturnType<typeof newPeer> | null = null;
     const pendingConnections = new Set<DataConnection>();
+    let authenticationClaimed = false;
     setHostState('starting');
     setNotice('Opening secure P2P rendezvous…');
 
@@ -265,6 +345,12 @@ export function HostController() {
       setControllerName('Phone');
       setHostState('ready');
       setNotice('Waiting for your phone');
+      authenticationClaimed = false;
+      if (pendingPairingCodeRef.current) {
+        const replacement = pendingPairingCodeRef.current;
+        pendingPairingCodeRef.current = '';
+        setPairingCode(replacement);
+      }
     };
 
     const shareScreenWith = async (remoteId: string, sourcePeer: ReturnType<typeof newPeer>, controllerProtocol: number) => {
@@ -342,6 +428,25 @@ export function HostController() {
           incoming.close();
           return;
         }
+        const activeConnection = connectionRef.current;
+        const sameDeviceReconnect = modernDevice
+          && metadata.deviceId === connectedDeviceIdRef.current;
+        if (
+          activeConnection?.open
+          && (!sameDeviceReconnect || Date.now() - lastAuthenticatedActivityRef.current < 15_000)
+        ) {
+          const rejectBusy = () => {
+            void incoming.send({ type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
+            window.setTimeout(() => incoming.close(), 150);
+          };
+          if (incoming.open) rejectBusy();
+          else incoming.on('open', rejectBusy);
+          return;
+        }
+        if (activeConnection?.open) {
+          activeConnection.close();
+          authenticationClaimed = false;
+        }
         pendingConnections.add(incoming);
         let authenticated = false;
         let authenticating = false;
@@ -368,13 +473,23 @@ export function HostController() {
               incoming.close();
               return;
             }
+            if (authenticationClaimed) {
+              void incoming.send({ type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
+              window.setTimeout(() => incoming.close(), 150);
+              return;
+            }
             authenticating = true;
+            authenticationClaimed = true;
             void (async () => {
               const authenticatedDeviceId = typeof data.deviceId === 'string' ? data.deviceId : '';
+              const verification = mode === 'trusted' && authenticatedDeviceId
+                ? await api.verifyTrustedDevice(authenticatedDeviceId, challenge, data.nonce, data.proof)
+                : null;
               const valid = mode === 'trusted'
-                ? Boolean(authenticatedDeviceId) && await api.verifyTrustedDevice(authenticatedDeviceId, challenge, data.nonce, data.proof)
+                ? Boolean(verification?.ok && securityRef.current.trustedReconnectEnabled)
                 : data.proof === await authProofForCode(pairingCode, challenge, data.nonce);
-              if (disposed || !valid) {
+              if (disposed || !incoming.open || !valid) {
+                authenticationClaimed = false;
                 void incoming.send({
                   type: 'auth-rejected',
                   reason: mode === 'trusted' ? 'trusted-device-revoked' : 'authentication-failed',
@@ -382,12 +497,22 @@ export function HostController() {
                 window.setTimeout(() => incoming.close(), 120);
                 return;
               }
-              if (mode === 'trusted') {
-                const freshSettings = await api.getSettings();
-                if (!disposed) setTrustedDevices(freshSettings.trustedDevices);
+              const currentActive = connectionRef.current;
+              const sameAuthenticatedDevice = Boolean(authenticatedDeviceId)
+                && authenticatedDeviceId === connectedDeviceIdRef.current;
+              if (
+                currentActive?.open && currentActive !== incoming
+                && (!sameAuthenticatedDevice || Date.now() - lastAuthenticatedActivityRef.current < 15_000)
+              ) {
+                authenticationClaimed = false;
+                void incoming.send({ type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
+                window.setTimeout(() => incoming.close(), 150);
+                return;
               }
+              if (verification) setTrustedDevices(verification.devices);
 
               authenticated = true;
+              lastAuthenticatedActivityRef.current = Date.now();
               window.clearTimeout(authDeadline);
               pendingConnections.delete(incoming);
               const previous = connectionRef.current;
@@ -404,7 +529,16 @@ export function HostController() {
               setNotice('Phone authenticated — starting screen…');
               shareScreenRef.current = () => shareScreenWith(incoming.peer, sourcePeer, controllerProtocol);
               void incoming.send({ type: 'auth-ok' } satisfies HostMessage);
-              if (mode === 'code' && modernDevice && data.deviceId) {
+              if (mode === 'trusted' && verification?.ok) {
+                void incoming.send({
+                  type: 'trusted-credential',
+                  deviceId: verification.deviceId,
+                  hostId: verification.hostId,
+                  token: verification.token,
+                  expiresAt: verification.expiresAt,
+                } satisfies HostMessage);
+              }
+              if (mode === 'code' && modernDevice && data.deviceId && securityRef.current.trustedReconnectEnabled) {
                 try {
                   const credential = await api.issueTrustedDevice(data.deviceId, safeName);
                   if (disposed || connectionRef.current !== incoming) return;
@@ -414,28 +548,42 @@ export function HostController() {
                     deviceId: credential.deviceId,
                     hostId: credential.hostId,
                     token: credential.token,
+                    expiresAt: credential.expiresAt,
                   } satisfies HostMessage);
                 } catch {
                   void incoming.send({ type: 'notice', message: 'Connected, but this phone could not be saved as a trusted device.' } satisfies HostMessage);
                 }
               }
+              if (mode === 'code' && modernDevice && securityRef.current.trustedReconnectEnabled) {
+                const replacement = createPairingCode();
+                pendingPairingCodeRef.current = replacement;
+                void api.saveSettings({ pairingCode: replacement });
+              }
               if (disposed || connectionRef.current !== incoming) return;
+              const capabilities = capabilitiesFor(securityRef.current);
               void incoming.send({
                 type: 'ready',
                 computerName,
                 jigglerEnabled: jigglerRef.current,
                 screenBlanked: screenBlankedRef.current,
-                dictationAvailable: groqKeyConfiguredRef.current,
+                dictationAvailable: groqKeyConfiguredRef.current && capabilities.dictation,
                 protocolVersion: PROTOCOL_VERSION,
-                capabilities: { trustedReconnect: true, clipboardText: true, systemAudio: true },
+                capabilities,
               } satisfies HostMessage);
-            })().catch(() => incoming.close());
+              window.setTimeout(() => {
+                if (!disposed && connectionRef.current === incoming) void api.hideWindow();
+              }, 350);
+            })().catch(() => {
+              authenticationClaimed = false;
+              incoming.close();
+            });
             return;
           }
           if (connectionRef.current !== incoming) {
             incoming.close();
             return;
           }
+          lastAuthenticatedActivityRef.current = Date.now();
           const now = Date.now();
           if (now - messageWindowStarted >= 1_000) {
             messageWindowStarted = now;
@@ -564,7 +712,8 @@ export function HostController() {
       setGroqKeyConfigured(configured);
       setGroqKeyDraft('');
       setNotice('Groq key encrypted for this Windows account');
-      send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current, dictationAvailable: configured });
+      groqKeyConfiguredRef.current = configured;
+      sendStatus();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not save the Groq key');
     }
@@ -574,9 +723,38 @@ export function HostController() {
     if (!api) return;
     await api.setGroqApiKey('');
     setGroqKeyConfigured(false);
+    groqKeyConfiguredRef.current = false;
     setGroqKeyDraft('');
     setNotice('Saved Groq key removed');
-    send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: screenBlankedRef.current, dictationAvailable: false });
+    sendStatus();
+  };
+
+  const updateSecurity = async (key: keyof SecuritySettings, enabled: boolean) => {
+    if (!api) return;
+    const next = { ...securityRef.current, [key]: enabled };
+    securityRef.current = next;
+    setSecurity(next);
+    await api.saveSettings({ security: next });
+    if (key === 'trustedReconnectEnabled' && !enabled) setTrustedDevices([]);
+    if (key === 'remoteInputEnabled' && !enabled) {
+      setNotice('View-only mode active — remote mouse and keyboard are blocked');
+    }
+    if (key === 'dictationEnabled' && !enabled) dictationsRef.current.clear();
+    if (key === 'systemAudioEnabled' && !enabled) {
+      requestedSystemAudioRef.current = false;
+      await shareScreenRef.current?.();
+    }
+    if (key === 'displayControlEnabled' && !enabled && screenBlankedRef.current) {
+      const blanked = await api.setDisplayBlanked(false);
+      screenBlankedRef.current = blanked;
+      setScreenBlanked(blanked);
+    }
+    sendStatus();
+  };
+
+  const activateLockdown = async () => {
+    if (!api) return;
+    await api.panicLockdown();
   };
 
   const copyCode = async () => {
@@ -584,6 +762,8 @@ export function HostController() {
     setCopied(true);
     setTimeout(() => setCopied(false), 1400);
   };
+
+  const localSettingsLocked = hostState === 'connected';
 
   return (
     <main className="host-shell">
@@ -601,9 +781,11 @@ export function HostController() {
             <span className="host-kicker"><Smartphone /> Connect your phone</span>
             <h1>{hostState === 'connected' ? `${controllerName} is connected` : 'Scan or enter this code'}</h1>
             <p>{hostState === 'connected' ? 'Your screen and controls are traveling directly between this PC and your phone.' : 'Open the controller on your phone. This code stays valid while the companion is running.'}</p>
-            <div className="pair-code-display" aria-label={`Pairing code ${pairingCode}`}>
-              <button type="button" onClick={copyCode}>{pairingCode.slice(0, 4)} <span>{pairingCode.slice(4, 8)}</span> {pairingCode.slice(8)}{copied ? <Check /> : <Copy />}</button>
-            </div>
+            {hostState !== 'connected' && (
+              <div className="pair-code-display" aria-label={`Pairing code ${pairingCode}`}>
+                <button type="button" onClick={copyCode}>{pairingCode.slice(0, 4)} <span>{pairingCode.slice(4, 8)}</span> {pairingCode.slice(8)}{copied ? <Check /> : <Copy />}</button>
+              </div>
+            )}
             <div className="flex flex-wrap gap-2">
               {hostState === 'connected' ? (
                 <Button variant="outline" onClick={() => connectionRef.current?.close()}><Unplug /> Disconnect phone</Button>
@@ -614,7 +796,9 @@ export function HostController() {
             </div>
           </div>
           <div className="qr-panel">
-            {pairingUrl ? (
+            {hostState === 'connected' ? (
+              <div className="qr-placeholder"><ShieldCheck /><span>Pairing details are hidden during an active remote session.</span></div>
+            ) : pairingUrl ? (
               <>
                 <strong className="qr-title">Scan to connect</strong>
                 <QRCodeSVG
@@ -630,7 +814,7 @@ export function HostController() {
             ) : (
               <div className="qr-placeholder"><Link2 /><span>Add your GitHub Pages address below to enable QR pairing.</span></div>
             )}
-            <small>{pairingUrl ? 'On your phone, tap Scan QR code and point the camera here' : 'Manual code pairing still works'}</small>
+            <small>{hostState === 'connected' ? 'Disconnect before pairing another phone' : pairingUrl ? 'On your phone, tap Scan QR code and point the camera here' : 'Manual code pairing still works'}</small>
           </div>
         </div>
 
@@ -655,8 +839,9 @@ export function HostController() {
                 checked={jigglerEnabled}
                 onCheckedChange={(enabled) => {
                   setJigglerEnabled(enabled);
+                  jigglerRef.current = enabled;
                   void api?.setJiggler(enabled);
-                  send({ type: 'status', jigglerEnabled: enabled, screenBlanked: screenBlankedRef.current, dictationAvailable: groqKeyConfiguredRef.current });
+                  sendStatus();
                 }}
               />
             </div>
@@ -667,8 +852,9 @@ export function HostController() {
                 checked={screenBlanked}
                 onCheckedChange={(blanked) => {
                   setScreenBlanked(blanked);
+                  screenBlankedRef.current = blanked;
                   void api?.setDisplayBlanked(blanked);
-                  send({ type: 'status', jigglerEnabled: jigglerRef.current, screenBlanked: blanked, dictationAvailable: groqKeyConfiguredRef.current });
+                  sendStatus();
                 }}
               />
             </div>
@@ -677,10 +863,34 @@ export function HostController() {
           <section className="host-settings-card">
             <div className="section-heading"><div><h2>Controller address</h2><p>Used only to create the QR code.</p></div><Link2 /></div>
             <div className="url-setting">
-              <Input value={urlDraft} onChange={(event) => setUrlDraft(event.target.value)} placeholder="https://name.github.io/compctrl/" />
-              <Button onClick={saveControllerUrl}>Save</Button>
+              <Input value={urlDraft} disabled={localSettingsLocked} onChange={(event) => setUrlDraft(event.target.value)} placeholder="https://name.github.io/compctrl/" />
+              <Button disabled={localSettingsLocked} onClick={saveControllerUrl}>Save</Button>
             </div>
             <p className="host-note"><CircleHelp /> Paste the address shown by GitHub Pages after publishing this project.</p>
+          </section>
+
+          <section className="host-settings-card host-wide-card security-card">
+            <div className="section-heading"><div><h2>Remote permissions</h2><p>Disconnect the phone before changing grants. Sensitive permissions start off.</p></div><ShieldAlert /></div>
+            {([
+              ['remoteInputEnabled', 'Mouse and keyboard', 'Turn off for view-only mode while keeping video connected'],
+              ['trustedReconnectEnabled', 'Remember trusted phones', 'Rotating credentials expire after 30 days or 7 inactive days'],
+              ['clipboardEnabled', 'Clipboard transfer', 'Allows explicit text reads and writes between devices'],
+              ['displayControlEnabled', 'Display power', 'Allows the phone to power local monitors off or back on'],
+              ['dictationEnabled', 'Voice dictation', 'Allows phone audio to be sent through the saved Groq key'],
+              ['systemAudioEnabled', 'System audio', 'Allows desktop audio to accompany the screen stream'],
+              ['powerActionsEnabled', 'Restart and shut down', 'Allows the phone to initiate Windows power actions'],
+            ] as Array<[keyof SecuritySettings, string, string]>).map(([key, label, description]) => (
+              <div className="host-setting-row" key={key}>
+                <span className="host-setting-icon"><ShieldCheck /></span>
+                <span><strong>{label}</strong><small>{description}</small></span>
+                <Switch checked={security[key]} disabled={localSettingsLocked} onCheckedChange={(enabled) => void updateSecurity(key, enabled)} />
+              </div>
+            ))}
+            <div className="security-lockdown">
+              <span><strong>Suspect a stolen or compromised device?</strong><small>Disconnect everything, revoke every phone, rotate connection IDs, restore displays, and enter view-only mode.</small></span>
+              <Button variant="destructive" onClick={() => void activateLockdown()}><ShieldAlert /> Emergency lockdown</Button>
+            </div>
+            <p className="host-note"><ShieldAlert /> Emergency shortcut: Ctrl+Alt+Shift+F11. Display recovery remains Ctrl+Alt+Shift+F12.</p>
           </section>
 
           <section className="host-settings-card host-wide-card">
@@ -694,7 +904,7 @@ export function HostController() {
                       <strong>{device.name}</strong>
                       <small>Last connected {new Date(device.lastSeenAt).toLocaleString()}</small>
                     </span>
-                    <Button variant="outline" size="icon" onClick={() => void revokeDevice(device.id)} aria-label={`Revoke ${device.name}`}>
+                    <Button variant="outline" size="icon" disabled={localSettingsLocked} onClick={() => void revokeDevice(device.id)} aria-label={`Revoke ${device.name}`}>
                       <Trash2 />
                     </Button>
                   </div>
@@ -709,14 +919,15 @@ export function HostController() {
             <div className="secret-setting">
               <Input
                 type="password"
+                disabled={localSettingsLocked}
                 value={groqKeyDraft}
                 onChange={(event) => setGroqKeyDraft(event.target.value)}
                 placeholder={groqKeyConfigured ? 'Groq key saved — enter a replacement' : 'Paste Groq API key'}
                 autoComplete="off"
                 spellCheck={false}
               />
-              <Button onClick={() => void saveGroqKey()} disabled={!groqKeyDraft.trim()}>Save key</Button>
-              {groqKeyConfigured && <Button variant="outline" size="icon" onClick={() => void removeGroqKey()} aria-label="Remove saved Groq API key"><Trash2 /></Button>}
+              <Button onClick={() => void saveGroqKey()} disabled={localSettingsLocked || !groqKeyDraft.trim()}>Save key</Button>
+              {groqKeyConfigured && <Button variant="outline" size="icon" disabled={localSettingsLocked} onClick={() => void removeGroqKey()} aria-label="Remove saved Groq API key"><Trash2 /></Button>}
             </div>
             <p className="host-note"><ShieldCheck /> {groqKeyConfigured ? 'Dictation is ready. Focus a Windows text field, then tap Voice on your phone.' : 'The phone never receives or stores this key.'}</p>
           </section>
@@ -724,7 +935,7 @@ export function HostController() {
 
         <div className="host-activity">
           <span className="activity-icon">{hostState === 'connected' ? <Laptop /> : hostState === 'error' ? <WifiOff /> : <Wifi />}</span>
-          <span><strong>{notice}</strong><small>{hostState === 'connected' ? 'Touch, keyboard, clipboard shortcuts, and power controls are active.' : 'The companion will keep retrying automatically if the network changes.'}</small></span>
+          <span><strong>{notice}</strong><small>{hostState === 'connected' ? (security.remoteInputEnabled ? 'The active-controller lock and local permission switches protect this session.' : 'View-only session: remote mouse and keyboard are blocked.') : 'The companion will keep retrying automatically if the network changes.'}</small></span>
         </div>
       </section>
     </main>
