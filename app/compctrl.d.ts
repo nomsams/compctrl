@@ -58,6 +58,7 @@ declare global {
       dispatch(message: import('@/lib/protocol').ControllerMessage): Promise<void>;
       setJiggler(enabled: boolean): Promise<void>;
       setDisplayBlanked(enabled: boolean): Promise<boolean>;
+      authorizeDisplayCapture(audioRequested: boolean): Promise<void>;
       systemAction(action: 'restart' | 'shutdown'): Promise<void>;
       onDisplayState(callback: (enabled: boolean) => void): () => void;
       onLockdown(callback: (state: {

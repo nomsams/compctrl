@@ -361,6 +361,7 @@ export function HostController() {
       send({ type: 'notice', message: withAudio ? 'Starting desktop capture with system audio…' : 'Starting desktop capture…' });
       try {
         stopStream();
+        await api.authorizeDisplayCapture(withAudio);
         const stream = await navigator.mediaDevices.getDisplayMedia({
           video: { frameRate: { ideal: 24, max: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: withAudio,

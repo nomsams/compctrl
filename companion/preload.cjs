@@ -14,6 +14,7 @@ contextBridge.exposeInMainWorld('compCtrl', {
   dispatch: (message) => ipcRenderer.invoke('compctrl:dispatch', message),
   setJiggler: (enabled) => ipcRenderer.invoke('compctrl:set-jiggler', enabled),
   setDisplayBlanked: (enabled) => ipcRenderer.invoke('compctrl:set-display-blanked', enabled),
+  authorizeDisplayCapture: (audioRequested) => ipcRenderer.invoke('compctrl:authorize-display-capture', audioRequested),
   systemAction: (action) => ipcRenderer.invoke('compctrl:system-action', action),
   onDisplayState: (callback) => {
     const handler = (_event, enabled) => callback(Boolean(enabled));

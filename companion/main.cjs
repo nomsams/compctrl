@@ -24,6 +24,7 @@ const path = require('node:path');
 const {
   DEFAULT_SECURITY_SETTINGS,
   TRUSTED_TOKEN_DELIVERY_GRACE_MS,
+  isAuthorizedDisplayMediaPermission,
   isTrustedDeviceFresh,
   normalizeSecuritySettings,
   trustedDeviceExpiry,
@@ -46,6 +47,7 @@ const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 12;
 const JIGGLE_INTERVAL_MS = 30_000;
 const DISPLAY_OFF_REASSERT_MS = 2_000;
+const DISPLAY_CAPTURE_AUTHORIZATION_MS = 5_000;
 const GROQ_TRANSCRIPTION_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
 const GROQ_WHISPER_MODEL = 'whisper-large-v3-turbo';
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
@@ -70,6 +72,7 @@ let isQuitting = false;
 let transcriptionInProgress = false;
 let transcriptionTimes = [];
 let trustedRendererOrigin = '';
+let displayCaptureAuthorization = null;
 
 function generateCode() {
   return Array.from(crypto.randomBytes(CODE_LENGTH), (byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
@@ -481,6 +484,23 @@ function isTrustedRendererUrl(value) {
   }
 }
 
+function activeDisplayCaptureAuthorization() {
+  if (!displayCaptureAuthorization || displayCaptureAuthorization.expiresAt < Date.now()) {
+    displayCaptureAuthorization = null;
+    return null;
+  }
+  return displayCaptureAuthorization;
+}
+
+function isTrustedMainRenderer(webContents, requestingUrl) {
+  return Boolean(
+    mainWindow && !mainWindow.isDestroyed()
+    && webContents === mainWindow.webContents
+    && isTrustedRendererUrl(webContents.getURL())
+    && isTrustedRendererUrl(requestingUrl),
+  );
+}
+
 function isAllowedExternalUrl(value) {
   try {
     const url = new URL(value);
@@ -494,6 +514,7 @@ function isAllowedExternalUrl(value) {
 
 function panicLockdown() {
   if (!settings) return;
+  displayCaptureAuthorization = null;
   settings.security = { ...settings.security, remoteInputEnabled: false, trustedReconnectEnabled: false };
   settings.trustedDevices = [];
   settings.pairingCode = generateCode();
@@ -614,6 +635,16 @@ function registerIpc() {
     assertTrustedIpc(event);
     if (typeof enabled !== 'boolean') return screenBlanked;
     return setScreenBlanked(enabled);
+  });
+
+  ipcMain.handle('compctrl:authorize-display-capture', (event, audioRequested) => {
+    assertTrustedIpc(event);
+    if (typeof audioRequested !== 'boolean') throw new Error('Invalid display-capture authorization request.');
+    if (audioRequested && !settings.security.systemAudioEnabled) throw new Error('System audio is disabled.');
+    displayCaptureAuthorization = {
+      audioRequested,
+      expiresAt: Date.now() + DISPLAY_CAPTURE_AUTHORIZATION_MS,
+    };
   });
 
   ipcMain.handle('compctrl:system-action', (event, action) => {
@@ -799,6 +830,19 @@ if (!app.requestSingleInstanceLock()) {
 
     const appSession = session.defaultSession;
     appSession.setDisplayMediaRequestHandler(async (request, callback) => {
+      const authorization = activeDisplayCaptureAuthorization();
+      const trustedFrame = Boolean(
+        request.frame && mainWindow && !mainWindow.isDestroyed()
+        && request.frame.top === mainWindow.webContents.mainFrame,
+      );
+      if (
+        !authorization || !trustedFrame || !isTrustedRendererUrl(request.securityOrigin)
+        || !request.videoRequested || request.audioRequested !== authorization.audioRequested
+      ) {
+        displayCaptureAuthorization = null;
+        callback(null);
+        return;
+      }
       try {
         const sources = await desktopCapturer.getSources({ types: ['screen'], thumbnailSize: { width: 0, height: 0 } });
         const primaryDisplayId = String(screen.getPrimaryDisplay().id);
@@ -811,15 +855,21 @@ if (!app.requestSingleInstanceLock()) {
       } catch (error) {
         console.error('Could not enumerate desktop capture sources:', error);
         callback(null);
+      } finally {
+        displayCaptureAuthorization = null;
       }
     }, { useSystemPicker: false });
-    appSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
-      const requestingUrl = details.requestingUrl || '';
-      callback(isTrustedRendererUrl(requestingUrl) && permission === 'display-capture');
+    appSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+      const requestingUrl = details?.requestingUrl || webContents?.getURL?.() || '';
+      callback(
+        isTrustedMainRenderer(webContents, requestingUrl)
+        && isAuthorizedDisplayMediaPermission(permission, details, Boolean(activeDisplayCaptureAuthorization())),
+      );
     });
-    appSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin, details) => {
+    appSession.setPermissionCheckHandler((webContents, permission, requestingOrigin, details) => {
       const requestingUrl = details?.requestingUrl || requestingOrigin || details?.securityOrigin || '';
-      return isTrustedRendererUrl(requestingUrl) && permission === 'display-capture';
+      return isTrustedMainRenderer(webContents, requestingUrl)
+        && isAuthorizedDisplayMediaPermission(permission, details, Boolean(activeDisplayCaptureAuthorization()));
     });
 
     createTray();
@@ -842,6 +892,7 @@ if (!app.requestSingleInstanceLock()) {
 }
 
 app.on('before-quit', () => {
+  displayCaptureAuthorization = null;
   if (screenBlanked) setScreenBlanked(false);
   isQuitting = true;
 });

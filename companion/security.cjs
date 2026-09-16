@@ -37,11 +37,20 @@ function isTrustedDeviceFresh(entry, now = Date.now()) {
     && now - lastSeenAt <= TRUSTED_DEVICE_MAX_IDLE_MS;
 }
 
+function isAuthorizedDisplayMediaPermission(permission, details, authorizationActive) {
+  if (!authorizationActive) return false;
+  if (permission === 'display-capture') return true;
+  return permission === 'media'
+    && Array.isArray(details?.mediaTypes)
+    && details.mediaTypes.length === 0;
+}
+
 module.exports = {
   DEFAULT_SECURITY_SETTINGS,
   TRUSTED_DEVICE_MAX_AGE_MS,
   TRUSTED_DEVICE_MAX_IDLE_MS,
   TRUSTED_TOKEN_DELIVERY_GRACE_MS,
+  isAuthorizedDisplayMediaPermission,
   isTrustedDeviceFresh,
   normalizeSecuritySettings,
   trustedDeviceExpiry,

@@ -5,6 +5,7 @@ const {
   TRUSTED_DEVICE_MAX_AGE_MS,
   TRUSTED_DEVICE_MAX_IDLE_MS,
   TRUSTED_TOKEN_DELIVERY_GRACE_MS,
+  isAuthorizedDisplayMediaPermission,
   isTrustedDeviceFresh,
   normalizeSecuritySettings,
   trustedDeviceExpiry,
@@ -33,4 +34,13 @@ test('trusted credentials expire by age and inactivity', () => {
   assert.equal(isTrustedDeviceFresh({ createdAt: now - TRUSTED_DEVICE_MAX_IDLE_MS, lastSeenAt: now - TRUSTED_DEVICE_MAX_IDLE_MS - 1 }, now), false);
   assert.equal(trustedDeviceExpiry({ createdAt: now, expiresAt: now + TRUSTED_DEVICE_MAX_AGE_MS * 2 }), now + TRUSTED_DEVICE_MAX_AGE_MS);
   assert.equal(TRUSTED_TOKEN_DELIVERY_GRACE_MS, 120_000);
+});
+
+test('display capture permission does not grant camera or microphone access', () => {
+  assert.equal(isAuthorizedDisplayMediaPermission('display-capture', {}, true), true);
+  assert.equal(isAuthorizedDisplayMediaPermission('media', { mediaTypes: [] }, true), true);
+  assert.equal(isAuthorizedDisplayMediaPermission('media', { mediaTypes: ['video'] }, true), false);
+  assert.equal(isAuthorizedDisplayMediaPermission('media', { mediaTypes: ['audio'] }, true), false);
+  assert.equal(isAuthorizedDisplayMediaPermission('media', { mediaTypes: [] }, false), false);
+  assert.equal(isAuthorizedDisplayMediaPermission('notifications', {}, true), false);
 });
