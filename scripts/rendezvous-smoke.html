@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>CompCtrl rendezvous smoke test</title>
+  </head>
+  <body>
+    <script src="../node_modules/peerjs/dist/peerjs.min.js"></script>
+    <script>
+      const withTimeout = (promise, milliseconds, label) => Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out.`)), milliseconds)),
+      ]);
+
+      const waitForOpen = (target, label) => {
+        if (target.open) return Promise.resolve();
+        return withTimeout(new Promise((resolve, reject) => {
+          target.once('open', resolve);
+          target.once('error', reject);
+        }), 12_000, label);
+      };
+
+      const run = async () => {
+        const startedAt = performance.now();
+        const options = {
+          debug: 0,
+          config: {
+            iceServers: [
+              { urls: 'stun:stun.l.google.com:19302' },
+              { urls: 'stun:stun1.l.google.com:19302' },
+            ],
+            iceCandidatePoolSize: 2,
+          },
+        };
+        const hostId = `compctrl-smoke-${crypto.randomUUID()}`;
+        const host = new Peer(hostId, options);
+        const controller = new Peer(options);
+        let outgoing;
+        let incoming;
+        let mediaCall;
+        let syntheticStream;
+        let canvasTimer;
+
+        try {
+          await Promise.all([
+            withTimeout(new Promise((resolve, reject) => {
+              host.once('open', resolve);
+              host.once('error', reject);
+            }), 12_000, 'Host registration'),
+            withTimeout(new Promise((resolve, reject) => {
+              controller.once('open', resolve);
+              controller.once('error', reject);
+            }), 12_000, 'Controller registration'),
+          ]);
+
+          const incomingConnection = withTimeout(new Promise((resolve) => host.once('connection', resolve)), 12_000, 'Incoming data connection');
+          outgoing = controller.connect(hostId, { reliable: true, serialization: 'json' });
+          incoming = await incomingConnection;
+          await Promise.all([
+            waitForOpen(outgoing, 'Outgoing data connection'),
+            waitForOpen(incoming, 'Incoming data connection'),
+          ]);
+
+          const challenge = crypto.randomUUID();
+          const response = `${challenge}:controller-ok`;
+          const authenticated = withTimeout(new Promise((resolve, reject) => {
+            outgoing.on('data', (message) => {
+              if (message?.type !== 'challenge' || message.value !== challenge) {
+                reject(new Error('Controller received an invalid challenge.'));
+                return;
+              }
+              outgoing.send({ type: 'response', value: response });
+            });
+            incoming.on('data', (message) => {
+              if (message?.type !== 'response' || message.value !== response) {
+                reject(new Error('Host received an invalid response.'));
+                return;
+              }
+              resolve(true);
+            });
+          }), 12_000, 'Data authentication');
+          incoming.send({ type: 'challenge', value: challenge });
+          await authenticated;
+
+          const canvas = document.createElement('canvas');
+          canvas.width = 64;
+          canvas.height = 32;
+          const context = canvas.getContext('2d', { alpha: false });
+          context.fillStyle = '#e53935';
+          context.fillRect(0, 0, 32, 32);
+          context.fillStyle = '#43a047';
+          context.fillRect(32, 0, 32, 32);
+          syntheticStream = canvas.captureStream(10);
+          let frame = 0;
+          canvasTimer = setInterval(() => {
+            context.fillStyle = frame++ % 2 === 0 ? '#e53935' : '#43a047';
+            context.fillRect(31, 0, 2, 2);
+          }, 100);
+
+          let rejectMediaCall;
+          const pixels = withTimeout(new Promise((resolve, reject) => {
+            rejectMediaCall = reject;
+            controller.once('call', (call) => {
+              call.answer();
+              call.once('error', reject);
+              call.once('stream', async (stream) => {
+                try {
+                  const video = document.createElement('video');
+                  video.muted = true;
+                  video.playsInline = true;
+                  video.srcObject = stream;
+                  await video.play();
+                  await new Promise((done) => {
+                    if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) done();
+                    else video.addEventListener('loadeddata', done, { once: true });
+                  });
+                  const sample = document.createElement('canvas');
+                  sample.width = 64;
+                  sample.height = 32;
+                  const sampleContext = sample.getContext('2d', { willReadFrequently: true });
+                  sampleContext.drawImage(video, 0, 0, 64, 32);
+                  const left = [...sampleContext.getImageData(16, 16, 1, 1).data.slice(0, 3)];
+                  const right = [...sampleContext.getImageData(48, 16, 1, 1).data.slice(0, 3)];
+                  if (!(left[0] > left[1] + 40 && right[1] > right[0] + 20)) {
+                    throw new Error(`Synthetic video pixels were incorrect: left=${left}, right=${right}`);
+                  }
+                  resolve({ left, right });
+                } catch (error) {
+                  reject(error);
+                }
+              });
+            });
+          }), 18_000, 'Synthetic video');
+          mediaCall = host.call(controller.id, syntheticStream, { metadata: { synthetic: true } });
+          mediaCall.once('error', rejectMediaCall);
+          const sampledPixels = await pixels;
+
+          return {
+            rendezvous: true,
+            dataChannel: true,
+            syntheticVideo: true,
+            sampledPixels,
+            elapsedMs: Math.round(performance.now() - startedAt),
+          };
+        } finally {
+          if (canvasTimer) clearInterval(canvasTimer);
+          syntheticStream?.getTracks().forEach((track) => track.stop());
+          mediaCall?.close();
+          outgoing?.close();
+          incoming?.close();
+          host.destroy();
+          controller.destroy();
+        }
+      };
+
+      window.runRendezvousSmokeTest = run;
+    </script>
+  </body>
+</html>

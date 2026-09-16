@@ -19,6 +19,7 @@
     "start": "wrangler dev --config dist/server/wrangler.json",
     "test:geometry": "node --experimental-strip-types --test lib/*.test.ts companion/*.test.cjs",
     "test:capture:windows": "electron scripts/capture-smoke.cjs --disable-wgc --webrtc-loopback",
+    "test:rendezvous": "electron scripts/rendezvous-smoke.cjs",
     "lint": "oxlint app lib",
     "format": "oxfmt"
   },
