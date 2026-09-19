@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.4-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.5-x64.exe
 ```
 
 ## Controls
@@ -54,13 +54,13 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - **Clipboard exchange** transfers text only when you explicitly press **Send to PC** or **Get from PC**. Clipboard images, files, and background monitoring are intentionally excluded.
 - The small **Apps** button opens Windows Task View for quick application switching.
 - **Type** opens the phone's native keyboard in a compact typing strip by default. Enable **Show full PC key panel** when you want the keyboard button to open function keys, modifiers, navigation keys, and arrows instead.
-- Use the dedicated **Up** and **Down** buttons on the edge of the desktop for reliable one-tap scrolling, or keep using the two-finger scroll gesture.
-- Fullscreen adds a dedicated **Enter** key beside left click, right click, and the two scroll buttons.
+- Use the dedicated **Up** and **Down** buttons on the left edge of the desktop for reliable one-tap scrolling, or use the faster two-finger scroll gesture.
+- Fullscreen keeps scrolling on the left and adds a dedicated **Enter** key beside left and right click controls on the right.
 - For voice dictation, create a key in the [Groq console](https://console.groq.com/keys), save it in the Windows companion, focus the desired text field on the remote computer, then tap **Voice** on the phone. Tap again to stop; the companion transcribes with `whisper-large-v3-turbo` and inserts the result at the focused Windows caret.
 - **Floating mini video** uses the phone browser's Picture-in-Picture mode when available, so the live computer view can stay above other apps. Return to the controller at any time; it resumes the existing session or reconnects automatically after mobile background suspension.
 - **Computer audio** can add Windows system sound to the P2P screen stream. It starts off for every new controller session and is enabled explicitly from session controls.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
-- **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
+- **Power local displays off** sends Windows' native monitor-power command to every display instead of drawing a black cover. The phone top bar always shows the acknowledged screen state. CompCtrl reasserts the off state after remote input and restores the displays from the phone, companion, tray, or **Ctrl+Alt+Shift+F12**.
 - If **Remember trusted phones** is enabled on Windows, the first successful code connection creates a high-entropy per-device credential. It rotates after every reconnect, expires after 30 days or 7 inactive days, and can be revoked locally. The temporary QR/code becomes single-use for modern controllers.
 - A dropped connection retries with exponential backoff, reacts immediately when the phone returns online, and remembers the last active computer across a page reload. Disconnecting manually disables auto-reconnect without revoking the phone.
 - Screen capture has its own recovery path: the phone reports whether the media path received packets, decoded frames, or produced black pixels; retries stalled video automatically; and provides **Play screen** and **Retry screen** actions without disconnecting mouse or keyboard control.

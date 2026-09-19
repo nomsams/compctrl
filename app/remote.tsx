@@ -74,6 +74,7 @@ import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { newPeer } from '@/lib/peer';
+import { uploadDictationAudio } from '@/lib/dictation-transfer';
 import {
   MAX_VIEW_SCALE,
   clamp,
@@ -137,12 +138,6 @@ type InstallPromptEvent = Event & {
   prompt(): Promise<void>;
   userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
 };
-
-function bytesToBase64(bytes: Uint8Array) {
-  let binary = '';
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary);
-}
 
 type WebkitPiPVideo = HTMLVideoElement & {
   webkitPresentationMode?: string;
@@ -272,6 +267,7 @@ export function RemoteController() {
   const [computerName, setComputerName] = useState('Windows PC');
   const [jigglerEnabled, setJigglerEnabled] = useState(false);
   const [screenBlanked, setScreenBlanked] = useState(false);
+  const [displayCommandPending, setDisplayCommandPending] = useState<boolean | null>(null);
   const [displayControlSupported, setDisplayControlSupported] = useState(false);
   const [dictationAvailable, setDictationAvailable] = useState(false);
   const [dictationState, setDictationState] = useState<DictationState>('idle');
@@ -296,6 +292,7 @@ export function RemoteController() {
   const dictationChunksRef = useRef<Blob[]>([]);
   const dictationIdRef = useRef('');
   const dictationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const displayRequestRef = useRef<{ requestId: string; blanked: boolean; timeout: ReturnType<typeof setTimeout> } | null>(null);
   const deviceIdRef = useRef('');
   const systemAudioEnabledRef = useRef(false);
   const hostCapabilitiesRef = useRef<HostCapabilities>(NO_HOST_CAPABILITIES);
@@ -337,6 +334,36 @@ export function RemoteController() {
     void connection.send(message);
     return true;
   }, []);
+
+  const settleDisplayState = useCallback((blanked: boolean, requestId?: string) => {
+    setScreenBlanked(blanked);
+    const pending = displayRequestRef.current;
+    if (!pending || (requestId && requestId !== pending.requestId) || (!requestId && blanked !== pending.blanked)) return;
+    clearTimeout(pending.timeout);
+    displayRequestRef.current = null;
+    setDisplayCommandPending(null);
+  }, []);
+
+  const requestScreenBlanked = useCallback((blanked: boolean) => {
+    if (!displayControlSupported || !hostCapabilitiesRef.current.displayPower) return;
+    const previous = displayRequestRef.current;
+    if (previous) clearTimeout(previous.timeout);
+    const requestId = createSecurityToken(12);
+    setDisplayCommandPending(blanked);
+    const timeout = setTimeout(() => {
+      if (displayRequestRef.current?.requestId !== requestId) return;
+      displayRequestRef.current = null;
+      setDisplayCommandPending(null);
+      setHostNotice('The computer did not confirm the display power change. Try again.');
+    }, 5_000);
+    displayRequestRef.current = { requestId, blanked, timeout };
+    if (!send({ type: 'display', blanked, requestId })) {
+      clearTimeout(timeout);
+      displayRequestRef.current = null;
+      setDisplayCommandPending(null);
+      setHostNotice('The computer connection was lost before the display command was sent.');
+    }
+  }, [displayControlSupported, send]);
 
   const stopRecorderTracks = useCallback(() => {
     recorderStreamRef.current?.getTracks().forEach((track) => track.stop());
@@ -397,13 +424,12 @@ export function RemoteController() {
           dictationChunksRef.current = [];
           if (!audio.length) throw new Error('No audio was recorded.');
           if (audio.length > 20 * 1024 * 1024) throw new Error('Recording is too large. Keep dictation under 90 seconds.');
-          const chunkSize = 45 * 1024;
-          const totalChunks = Math.ceil(audio.length / chunkSize);
-          for (let index = 0; index < totalChunks; index += 1) {
-            const data = bytesToBase64(audio.subarray(index * chunkSize, Math.min(audio.length, (index + 1) * chunkSize)));
-            if (!send({ type: 'dictation-chunk', id, index, data })) throw new Error('The computer connection was lost.');
-          }
-          if (!send({ type: 'dictation-end', id, totalChunks })) throw new Error('The computer connection was lost.');
+          await uploadDictationAudio(audio, id, async (message) => {
+            const connection = connectionRef.current;
+            if (!connection?.open) return false;
+            await connection.send(message);
+            return connection.open;
+          });
         })().catch((error) => {
           send({ type: 'dictation-cancel', id });
           setDictationState('error');
@@ -535,6 +561,10 @@ export function RemoteController() {
       stopRecorderTracks();
       setDictationState('idle');
       setDictationAvailable(false);
+      const displayRequest = displayRequestRef.current;
+      if (displayRequest) clearTimeout(displayRequest.timeout);
+      displayRequestRef.current = null;
+      setDisplayCommandPending(null);
       setMediaDiagnostic('');
       hostCapabilitiesRef.current = NO_HOST_CAPABILITIES;
       setHostCapabilities(NO_HOST_CAPABILITIES);
@@ -717,7 +747,7 @@ export function RemoteController() {
               if (!capabilities.dictation) cancelRevokedDictation();
               const supported = capabilities.displayPower;
               setDisplayControlSupported(supported);
-              setScreenBlanked(supported && message.screenBlanked);
+              settleDisplayState(supported && message.screenBlanked);
               setHostNotice('Connected. Starting desktop video…');
               if (!callRef.current) send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current });
             } else if (message.type === 'status') {
@@ -732,11 +762,14 @@ export function RemoteController() {
               if (!capabilities.dictation) cancelRevokedDictation();
               setDisplayControlSupported(capabilities.displayPower);
               if (typeof message.screenBlanked === 'boolean') {
-                setScreenBlanked(capabilities.displayPower && message.screenBlanked);
+                settleDisplayState(capabilities.displayPower && message.screenBlanked);
               }
             } else if (message.type === 'pong') {
               lastPongRef.current = Date.now();
             } else if (message.type === 'notice') {
+              setHostNotice(message.message);
+            } else if (message.type === 'display-result') {
+              settleDisplayState(message.blanked, message.requestId);
               setHostNotice(message.message);
             } else if (message.type === 'dictation-status' && message.id === dictationIdRef.current) {
               setDictationMessage(message.message);
@@ -912,7 +945,7 @@ export function RemoteController() {
       window.removeEventListener('focus', resumeWhenVisible);
       cleanTransport();
     };
-  }, [reconnectNonce, send, sessionCode, stopRecorderTracks]);
+  }, [reconnectNonce, send, sessionCode, settleDisplayState, stopRecorderTracks]);
 
   const startSession = () => { beginSession(code); };
 
@@ -985,16 +1018,13 @@ export function RemoteController() {
           send({ type: 'jiggler', enabled });
         }}
         screenBlanked={screenBlanked}
+        displayCommandPending={displayCommandPending}
         displayControlSupported={displayControlSupported}
         dictationAvailable={dictationAvailable}
         dictationState={dictationState}
         dictationMessage={dictationMessage}
         toggleDictation={toggleDictation}
-        setScreenBlanked={(blanked) => {
-          if (!displayControlSupported || !hostCapabilities.displayPower) return;
-          setScreenBlanked(blanked);
-          send({ type: 'display', blanked });
-        }}
+        setScreenBlanked={requestScreenBlanked}
         send={send}
         disconnect={disconnect}
         forgetTrustedDevice={() => {
@@ -1147,6 +1177,7 @@ type RemoteSurfaceProps = {
   jigglerEnabled: boolean;
   setJigglerEnabled(enabled: boolean): void;
   screenBlanked: boolean;
+  displayCommandPending: boolean | null;
   displayControlSupported: boolean;
   dictationAvailable: boolean;
   dictationState: DictationState;
@@ -1175,6 +1206,7 @@ function RemoteSurface({
   jigglerEnabled,
   setJigglerEnabled,
   screenBlanked,
+  displayCommandPending,
   displayControlSupported,
   dictationAvailable,
   dictationState,
@@ -1689,8 +1721,8 @@ function RemoteSurface({
         const nextScale = clamp(multi.startZoom * distance / multi.startDistance, 1, MAX_VIEW_SCALE);
         updateView(viewAroundAnchor(nextScale, multi.anchorScreen, clientToDisplay(midpoint.x, midpoint.y)));
       } else if (multi.mode === 'scroll') {
-        const deltaX = (multi.lastMidpoint.x - midpoint.x) * 1.35;
-        const deltaY = (multi.lastMidpoint.y - midpoint.y) * 2.2;
+        const deltaX = (multi.lastMidpoint.x - midpoint.x) * 1.8;
+        const deltaY = (multi.lastMidpoint.y - midpoint.y) * 3.6;
         if (hostCapabilities.remoteInput && (Math.abs(deltaX) > 0.4 || Math.abs(deltaY) > 0.4)) send({ type: 'wheel', deltaX, deltaY });
       }
       multi.lastMidpoint = midpoint;
@@ -1950,9 +1982,19 @@ function RemoteSurface({
       <header className="remote-topbar">
         <div className="min-w-0">
           <div className="flex items-center gap-2"><span className={`remote-state-dot ${connected ? 'is-live' : ''}`} /><strong className="truncate">{computerName}</strong></div>
-          <p>{statusText}{screenBlanked ? ' · Displays powered off' : ''} · {code.slice(0, 4)} {code.slice(4, 8)} {code.slice(8)}</p>
+          <p>{statusText} · {code.slice(0, 4)} {code.slice(4, 8)} {code.slice(8)}</p>
         </div>
         <div className="remote-topbar-actions">
+          <button
+            type="button"
+            className={`display-state-badge ${screenBlanked ? 'is-off' : 'is-on'} ${displayCommandPending !== null ? 'is-pending' : ''}`}
+            onClick={() => setScreenBlanked(!screenBlanked)}
+            disabled={!connected || !displayControlSupported || displayCommandPending !== null}
+            aria-label={displayCommandPending !== null ? 'Changing computer screen power' : screenBlanked ? 'Computer screen is off; tap to turn it on' : 'Computer screen is on; tap to turn it off'}
+          >
+            {screenBlanked ? <EyeOff /> : <Monitor />}
+            <span>{displayCommandPending !== null ? displayCommandPending ? 'Turning off…' : 'Turning on…' : screenBlanked ? 'Screen off' : 'Screen on'}</span>
+          </button>
           <Button variant="ghost" size="icon-lg" className="remote-icon-button" onClick={() => setClipboardOpen(true)} disabled={!hostCapabilities.clipboardText} aria-label="Open clipboard exchange">
             <Clipboard className="size-5" />
           </Button>
@@ -2051,7 +2093,7 @@ function RemoteSurface({
           </button>
         )}
         {screenBlanked && displayControlSupported && (
-          <button type="button" className="screen-blank-chip" onClick={() => setScreenBlanked(false)}>
+          <button type="button" className="screen-blank-chip" onClick={() => setScreenBlanked(false)} disabled={displayCommandPending !== null}>
             <EyeOff /> Displays off <small>Turn on</small>
           </button>
         )}
@@ -2069,34 +2111,30 @@ function RemoteSurface({
             {dictationState === 'recording' ? <MicOff /> : <Mic />} {dictationMessage}
           </output>
         )}
-        <div className={`scroll-buttons ${immersive ? 'has-clicks' : ''}`} aria-label="Pointer and scroll controls">
-          {immersive && (
-            <>
-              <button type="button" className="is-primary" onClick={() => sendPointer('click')} disabled={!inputAllowed} aria-label="Left click">
-                <MousePointerClick /><span>Left</span>
-              </button>
-              <button type="button" onClick={() => sendPointer('click', 'right')} disabled={!inputAllowed} aria-label="Right click">
-                <MousePointer2 /><span>Right</span>
-              </button>
-            </>
-          )}
+        <div className="scroll-buttons" aria-label="Scroll controls">
           <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: -360 })} disabled={!inputAllowed} aria-label="Scroll up">
             <ChevronUp /><span>Up</span>
           </button>
           <button type="button" onClick={() => send({ type: 'wheel', deltaX: 0, deltaY: 360 })} disabled={!inputAllowed} aria-label="Scroll down">
             <ChevronDown /><span>Down</span>
           </button>
-          {immersive && (
-            <>
-              <button type="button" onClick={() => send({ type: 'key', action: 'tap', key: 'Enter' })} disabled={!inputAllowed} aria-label="Press Enter">
-                <CornerDownLeft /><span>Enter</span>
-              </button>
-              <button type="button" className={dictationState === 'recording' ? 'is-recording' : ''} onClick={toggleDictation} disabled={!connected || !dictationAvailable || dictationBusy} aria-label={dictationState === 'recording' ? 'Stop and transcribe voice recording' : 'Start voice dictation'}>
-                {dictationState === 'recording' ? <MicOff /> : <Mic />}<span>{dictationLabel}</span>
-              </button>
-            </>
-          )}
         </div>
+        {immersive && (
+          <div className="immersive-action-buttons" aria-label="Pointer and keyboard controls">
+            <button type="button" className="is-primary" onClick={() => sendPointer('click')} disabled={!inputAllowed} aria-label="Left click">
+              <MousePointerClick /><span>Left</span>
+            </button>
+            <button type="button" onClick={() => sendPointer('click', 'right')} disabled={!inputAllowed} aria-label="Right click">
+              <MousePointer2 /><span>Right</span>
+            </button>
+            <button type="button" onClick={() => send({ type: 'key', action: 'tap', key: 'Enter' })} disabled={!inputAllowed} aria-label="Press Enter">
+              <CornerDownLeft /><span>Enter</span>
+            </button>
+            <button type="button" className={dictationState === 'recording' ? 'is-recording' : ''} onClick={toggleDictation} disabled={!connected || !dictationAvailable || dictationBusy} aria-label={dictationState === 'recording' ? 'Stop and transcribe voice recording' : 'Start voice dictation'}>
+              {dictationState === 'recording' ? <MicOff /> : <Mic />}<span>{dictationLabel}</span>
+            </button>
+          </div>
+        )}
       </div>
 
       <nav className="remote-toolbar" aria-label="Remote control shortcuts">
@@ -2414,7 +2452,7 @@ function RemoteSurface({
               </span>
               <Switch
                 checked={screenBlanked}
-                disabled={!displayControlSupported}
+                disabled={!displayControlSupported || displayCommandPending !== null}
                 onCheckedChange={setScreenBlanked}
                 aria-label="Turn the computer screens off locally"
               />

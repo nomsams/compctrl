@@ -4,6 +4,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public static class CompCtrlNative
 {
@@ -52,7 +53,7 @@ public static class CompCtrlNative
     [DllImport("user32.dll")] private static extern void keybd_event(byte virtualKey, byte scanCode, uint flags, UIntPtr extraInfo);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern short VkKeyScan(char character);
     [DllImport("user32.dll")] private static extern uint SendInput(uint count, INPUT[] inputs, int size);
-    [DllImport("user32.dll", SetLastError = true)] private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out UIntPtr result);
 
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
@@ -146,10 +147,21 @@ public static class CompCtrlNative
 
     public static void DisplayPower(bool off)
     {
-        // HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER. State 2 powers the
-        // physical displays off; -1 powers them back on.
-        PostMessage(new IntPtr(0xFFFF), 0x0112u, new IntPtr(0xF170), new IntPtr(off ? 2 : -1));
-        if (!off) Jiggle();
+        // HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER. A synchronous,
+        // bounded send keeps off/on commands ordered. Windows does not always
+        // wake a powered-down panel for SetCursorPos, so inject a zero-distance
+        // mouse move before and after the explicit monitor-on command.
+        UIntPtr result;
+        POINT original = new POINT();
+        bool restorePointer = !off && GetCursorPos(out original);
+        if (!off) mouse_event(0x0001u, 1, 0, 0, UIntPtr.Zero);
+        SendMessageTimeout(new IntPtr(0xFFFF), 0x0112u, new IntPtr(0xF170), new IntPtr(off ? 2 : -1), 0x0002u, 750u, out result);
+        if (!off)
+        {
+            Thread.Sleep(60);
+            mouse_event(0x0001u, 0, 1, 0, UIntPtr.Zero);
+            if (restorePointer) SetCursorPos(original.X, original.Y);
+        }
     }
 
     public static void ReleaseAll()

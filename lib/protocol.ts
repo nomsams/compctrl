@@ -44,7 +44,7 @@ export type WheelMessage = { type: 'wheel'; deltaX: number; deltaY: number };
 export type KeyMessage = { type: 'key'; action: 'down' | 'up' | 'tap'; key: string; modifiers?: Modifier[] };
 export type TextMessage = { type: 'text'; text: string };
 export type JigglerMessage = { type: 'jiggler'; enabled: boolean };
-export type DisplayMessage = { type: 'display'; blanked: boolean };
+export type DisplayMessage = { type: 'display'; blanked: boolean; requestId?: string };
 export type StreamMessage = { type: 'stream'; action: 'request'; systemAudio?: boolean };
 export type SystemMessage = { type: 'system'; action: 'restart' | 'shutdown' };
 export type PingMessage = { type: 'ping'; sentAt: number };
@@ -97,6 +97,7 @@ export type HostMessage =
   }
   | { type: 'status'; jigglerEnabled: boolean; screenBlanked: boolean; dictationAvailable: boolean; capabilities?: AdvertisedHostCapabilities }
   | { type: 'clipboard-result'; requestId: string; action: 'read' | 'write'; ok: boolean; text?: string; message: string }
+  | { type: 'display-result'; requestId: string; blanked: boolean; ok: boolean; message: string }
   | { type: 'dictation-status'; id: string; status: 'receiving' | 'transcribing' | 'done' | 'error'; message: string }
   | { type: 'pong'; sentAt: number }
   | { type: 'notice'; message: string };
@@ -210,7 +211,9 @@ export function isControllerMessage(value: unknown): value is ControllerMessage 
     case 'text':
       return typeof value.text === 'string' && value.text.length > 0 && value.text.length <= MAX_TEXT_LENGTH;
     case 'jiggler': return typeof value.enabled === 'boolean';
-    case 'display': return typeof value.blanked === 'boolean';
+    case 'display':
+      return typeof value.blanked === 'boolean'
+        && (value.requestId === undefined || (typeof value.requestId === 'string' && tokenPattern.test(value.requestId)));
     case 'stream': return value.action === 'request' && (value.systemAudio === undefined || typeof value.systemAudio === 'boolean');
     case 'system': return value.action === 'restart' || value.action === 'shutdown';
     case 'ping': return isFiniteNumber(value.sentAt) && value.sentAt >= 0;
@@ -287,6 +290,10 @@ export function isHostMessage(value: unknown): value is HostMessage {
       return typeof value.requestId === 'string' && tokenPattern.test(value.requestId)
         && (value.action === 'read' || value.action === 'write') && typeof value.ok === 'boolean'
         && (value.text === undefined || (typeof value.text === 'string' && value.text.length <= MAX_CLIPBOARD_TEXT_LENGTH))
+        && typeof value.message === 'string' && value.message.length <= 256;
+    case 'display-result':
+      return typeof value.requestId === 'string' && tokenPattern.test(value.requestId)
+        && typeof value.blanked === 'boolean' && typeof value.ok === 'boolean'
         && typeof value.message === 'string' && value.message.length <= 256;
     case 'dictation-status':
       return typeof value.id === 'string' && dictationIdPattern.test(value.id)

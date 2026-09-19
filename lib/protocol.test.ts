@@ -45,6 +45,8 @@ void test('rejects malformed or oversized remote-control messages', () => {
   assert.equal(isControllerMessage({ type: 'trusted-credential-ack', deviceId: 'device_abcdefghijkl' }), true);
   assert.equal(isControllerMessage({ type: 'trusted-credential-ack', deviceId: '../bad device' }), false);
   assert.equal(isControllerMessage({ type: 'system', action: 'format-disk' }), false);
+  assert.equal(isControllerMessage({ type: 'display', blanked: true, requestId: 'displayRequest_123' }), true);
+  assert.equal(isControllerMessage({ type: 'display', blanked: true, requestId: '../invalid' }), false);
 });
 
 void test('keeps protocol 2 screen sessions working during a protocol 3 rollout', () => {
@@ -87,6 +89,7 @@ void test('validates security capability updates and busy-session rejection', ()
     capabilities,
   }), true);
   assert.equal(isHostMessage({ type: 'auth-rejected', reason: 'session-busy' }), true);
+  assert.equal(isHostMessage({ type: 'display-result', requestId: 'displayRequest_123', blanked: false, ok: true, message: 'Displays restored.' }), true);
   assert.equal(isHostMessage({
     type: 'trusted-credential',
     deviceId: 'device_abcdefghijkl',

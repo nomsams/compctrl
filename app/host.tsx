@@ -171,13 +171,24 @@ export function HostController() {
     }
     if (message.type === 'display') {
       if (!securityRef.current.displayControlEnabled) {
-        send({ type: 'notice', message: 'Display control is disabled on the computer.' });
+        const detail = 'Display control is disabled on the computer.';
+        if (message.requestId) send({ type: 'display-result', requestId: message.requestId, blanked: screenBlankedRef.current, ok: false, message: detail });
+        else send({ type: 'notice', message: detail });
         return;
       }
-      const blanked = await api.setDisplayBlanked(message.blanked);
-      setScreenBlanked(blanked);
-      setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
-      sendStatus();
+      try {
+        const blanked = await api.setDisplayBlanked(message.blanked);
+        screenBlankedRef.current = blanked;
+        setScreenBlanked(blanked);
+        const detail = blanked ? 'Computer screen is off.' : 'Computer screen is on.';
+        setNotice(detail);
+        if (message.requestId) send({ type: 'display-result', requestId: message.requestId, blanked, ok: true, message: detail });
+        sendStatus();
+      } catch {
+        const detail = 'Windows could not change the display power state.';
+        if (message.requestId) send({ type: 'display-result', requestId: message.requestId, blanked: screenBlankedRef.current, ok: false, message: detail });
+        else send({ type: 'notice', message: detail });
+      }
       return;
     }
     if (message.type === 'dictation-start') {
@@ -305,6 +316,7 @@ export function HostController() {
   useEffect(() => {
     if (!api) return;
     return api.onDisplayState((blanked) => {
+      screenBlankedRef.current = blanked;
       setScreenBlanked(blanked);
       setNotice(blanked ? 'Local displays powered off' : 'Local displays restored');
       sendStatus();
@@ -859,10 +871,13 @@ export function HostController() {
               <Switch
                 checked={screenBlanked}
                 onCheckedChange={(blanked) => {
-                  setScreenBlanked(blanked);
-                  screenBlankedRef.current = blanked;
-                  void api?.setDisplayBlanked(blanked);
-                  sendStatus();
+                  void (async () => {
+                    if (!api) return;
+                    const actual = await api.setDisplayBlanked(blanked);
+                    screenBlankedRef.current = actual;
+                    setScreenBlanked(actual);
+                    sendStatus();
+                  })();
                 }}
               />
             </div>
