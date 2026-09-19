@@ -38,7 +38,10 @@
         let outgoing;
         let incoming;
         let mediaCall;
+        let replacementOutgoing;
+        let replacementIncoming;
         let syntheticStream;
+        let receivedStream;
         let canvasTimer;
 
         try {
@@ -105,6 +108,7 @@
               call.once('error', reject);
               call.once('stream', async (stream) => {
                 try {
+                  receivedStream = stream;
                   const video = document.createElement('video');
                   video.muted = true;
                   video.playsInline = true;
@@ -135,10 +139,52 @@
           mediaCall.once('error', rejectMediaCall);
           const sampledPixels = await pixels;
 
+          const continuityProbe = crypto.randomUUID();
+          const dataStayedOpen = withTimeout(new Promise((resolve, reject) => {
+            const receiveProbe = (message) => {
+              if (message?.type !== 'continuity-probe' || message.value !== continuityProbe) return;
+              outgoing.off('data', receiveProbe);
+              outgoing.send({ type: 'continuity-ack', value: continuityProbe });
+            };
+            const receiveAck = (message) => {
+              if (message?.type !== 'continuity-ack' || message.value !== continuityProbe) return;
+              incoming.off('data', receiveAck);
+              resolve(true);
+            };
+            outgoing.on('data', receiveProbe);
+            incoming.on('data', receiveAck);
+            controller.disconnect();
+            setTimeout(() => {
+              try { incoming.send({ type: 'continuity-probe', value: continuityProbe }); }
+              catch (error) { reject(error); }
+            }, 250);
+          }), 8_000, 'Data continuity during signaling interruption');
+          await dataStayedOpen;
+          const mediaStayedLive = receivedStream?.getVideoTracks()[0]?.readyState === 'live';
+          if (!mediaStayedLive) throw new Error('Synthetic video stopped when signaling disconnected.');
+
+          const signalingRestored = withTimeout(new Promise((resolve, reject) => {
+            controller.once('open', resolve);
+            controller.once('error', reject);
+            controller.reconnect();
+          }), 12_000, 'Controller signaling reconnect');
+          await signalingRestored;
+
+          const replacementAccepted = withTimeout(new Promise((resolve) => host.once('connection', resolve)), 12_000, 'Replacement data connection');
+          replacementOutgoing = controller.connect(hostId, { reliable: true, serialization: 'json' });
+          replacementIncoming = await replacementAccepted;
+          await Promise.all([
+            waitForOpen(replacementOutgoing, 'Replacement outgoing data connection'),
+            waitForOpen(replacementIncoming, 'Replacement incoming data connection'),
+          ]);
+
           return {
             rendezvous: true,
             dataChannel: true,
             syntheticVideo: true,
+            signalingInterruption: true,
+            signalingReconnect: true,
+            replacementConnection: true,
             sampledPixels,
             elapsedMs: Math.round(performance.now() - startedAt),
           };
@@ -146,6 +192,8 @@
           if (canvasTimer) clearInterval(canvasTimer);
           syntheticStream?.getTracks().forEach((track) => track.stop());
           mediaCall?.close();
+          replacementOutgoing?.close();
+          replacementIncoming?.close();
           outgoing?.close();
           incoming?.close();
           host.destroy();

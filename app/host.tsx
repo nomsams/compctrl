@@ -27,7 +27,9 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { SIGNALING_RECONNECT_DELAY_MS, shouldRejectControllerTakeover } from '@/lib/connection-reliability';
 import { newPeer } from '@/lib/peer';
+import { queuePeerMessage } from '@/lib/peer-transport';
 import {
   type ControllerMessage,
   type HostMessage,
@@ -112,6 +114,7 @@ export function HostController() {
   const trustedPeerRef = useRef<ReturnType<typeof newPeer> | null>(null);
   const shareScreenRef = useRef<(() => Promise<void>) | null>(null);
   const capturePendingRef = useRef(false);
+  const captureQueuedRef = useRef(false);
   const requestedSystemAudioRef = useRef(false);
   const connectedDeviceIdRef = useRef('');
   const lastAuthenticatedActivityRef = useRef(0);
@@ -142,7 +145,7 @@ export function HostController() {
   }, [pairingCode]);
 
   const send = useCallback((message: HostMessage) => {
-    if (connectionRef.current?.open) void connectionRef.current.send(message);
+    queuePeerMessage(connectionRef.current, message);
   }, []);
 
   const sendStatus = useCallback(() => {
@@ -353,6 +356,7 @@ export function HostController() {
       connectedDeviceIdRef.current = '';
       requestedSystemAudioRef.current = false;
       shareScreenRef.current = null;
+      captureQueuedRef.current = false;
       stopStream();
       setControllerName('Phone');
       setHostState('ready');
@@ -366,7 +370,13 @@ export function HostController() {
     };
 
     const shareScreenWith = async (remoteId: string, sourcePeer: ReturnType<typeof newPeer>, controllerProtocol: number) => {
-      if (capturePendingRef.current || !connectionRef.current?.open) return;
+      if (capturePendingRef.current) {
+        captureQueuedRef.current = true;
+        return;
+      }
+      const requestedConnection = connectionRef.current;
+      if (!requestedConnection?.open) return;
+      captureQueuedRef.current = false;
       capturePendingRef.current = true;
       const withAudio = requestedSystemAudioRef.current;
       setNotice(withAudio ? 'Starting desktop capture with system audio…' : 'Starting desktop capture…');
@@ -378,7 +388,7 @@ export function HostController() {
           video: { frameRate: { ideal: 24, max: 30 }, width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: withAudio,
         });
-        if (disposed || !connectionRef.current?.open) {
+        if (disposed || connectionRef.current !== requestedConnection || !requestedConnection.open) {
           stream.getTracks().forEach((track) => track.stop());
           return;
         }
@@ -398,6 +408,11 @@ export function HostController() {
           }
         });
         const call = sourcePeer.call(remoteId, stream, { metadata: { protocol: controllerProtocol, systemAudio: stream.getAudioTracks().length > 0 } });
+        if (!call) {
+          streamRef.current = null;
+          stream.getTracks().forEach((track) => track.stop());
+          throw new Error('The P2P rendezvous is reconnecting. Retrying the screen path shortly.');
+        }
         callRef.current = call;
         const finishCall = () => {
           if (callRef.current !== call) return;
@@ -415,6 +430,10 @@ export function HostController() {
         send({ type: 'notice', message: `Screen capture failed: ${detail}` });
       } finally {
         capturePendingRef.current = false;
+        if (captureQueuedRef.current && !disposed && connectionRef.current?.open) {
+          captureQueuedRef.current = false;
+          queueMicrotask(() => { void shareScreenRef.current?.(); });
+        }
       }
     };
 
@@ -444,12 +463,9 @@ export function HostController() {
         const activeConnection = connectionRef.current;
         const sameDeviceReconnect = modernDevice
           && metadata.deviceId === connectedDeviceIdRef.current;
-        if (
-          activeConnection?.open
-          && (!sameDeviceReconnect || Date.now() - lastAuthenticatedActivityRef.current < 15_000)
-        ) {
+        if (shouldRejectControllerTakeover(Boolean(activeConnection?.open), sameDeviceReconnect, lastAuthenticatedActivityRef.current)) {
           const rejectBusy = () => {
-            void incoming.send({ type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
+            queuePeerMessage(incoming, { type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
             window.setTimeout(() => incoming.close(), 150);
           };
           if (incoming.open) rejectBusy();
@@ -472,7 +488,7 @@ export function HostController() {
         incoming.on('open', () => {
           challenge = createSecurityToken();
           setNotice(mode === 'trusted' ? 'Recognized phone found — verifying its device key…' : 'Phone found — verifying pairing secret…');
-          void incoming.send({ type: 'auth-challenge', challenge } satisfies HostMessage);
+          queuePeerMessage(incoming, { type: 'auth-challenge', challenge } satisfies HostMessage);
         });
         incoming.on('data', (data) => {
           if (!isControllerMessage(data)) {
@@ -488,7 +504,7 @@ export function HostController() {
               return;
             }
             if (authenticationClaimed) {
-              void incoming.send({ type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
+              queuePeerMessage(incoming, { type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
               window.setTimeout(() => incoming.close(), 150);
               return;
             }
@@ -504,7 +520,7 @@ export function HostController() {
                 : data.proof === await authProofForCode(pairingCode, challenge, data.nonce);
               if (disposed || !incoming.open || !valid) {
                 authenticationClaimed = false;
-                void incoming.send({
+                queuePeerMessage(incoming, {
                   type: 'auth-rejected',
                   reason: mode === 'trusted' ? 'trusted-device-revoked' : 'authentication-failed',
                 } satisfies HostMessage);
@@ -515,11 +531,11 @@ export function HostController() {
               const sameAuthenticatedDevice = Boolean(authenticatedDeviceId)
                 && authenticatedDeviceId === connectedDeviceIdRef.current;
               if (
-                currentActive?.open && currentActive !== incoming
-                && (!sameAuthenticatedDevice || Date.now() - lastAuthenticatedActivityRef.current < 15_000)
+                currentActive !== incoming
+                && shouldRejectControllerTakeover(Boolean(currentActive?.open), sameAuthenticatedDevice, lastAuthenticatedActivityRef.current)
               ) {
                 authenticationClaimed = false;
-                void incoming.send({ type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
+                queuePeerMessage(incoming, { type: 'auth-rejected', reason: 'session-busy' } satisfies HostMessage);
                 window.setTimeout(() => incoming.close(), 150);
                 return;
               }
@@ -542,9 +558,9 @@ export function HostController() {
               setHostState('connected');
               setNotice('Phone authenticated — starting screen…');
               shareScreenRef.current = () => shareScreenWith(incoming.peer, sourcePeer, controllerProtocol);
-              void incoming.send({ type: 'auth-ok' } satisfies HostMessage);
+              queuePeerMessage(incoming, { type: 'auth-ok' } satisfies HostMessage);
               if (mode === 'trusted' && verification?.ok) {
-                void incoming.send({
+                queuePeerMessage(incoming, {
                   type: 'trusted-credential',
                   deviceId: verification.deviceId,
                   hostId: verification.hostId,
@@ -558,7 +574,7 @@ export function HostController() {
                   if (disposed || connectionRef.current !== incoming) return;
                   setTrustedDevices(credential.devices);
                   credentialAwaitingAckForDevice = credential.deviceId;
-                  void incoming.send({
+                  queuePeerMessage(incoming, {
                     type: 'trusted-credential',
                     deviceId: credential.deviceId,
                     hostId: credential.hostId,
@@ -567,12 +583,12 @@ export function HostController() {
                     requiresAck: true,
                   } satisfies HostMessage);
                 } catch {
-                  void incoming.send({ type: 'notice', message: 'Connected, but this phone could not be saved as a trusted device.' } satisfies HostMessage);
+                  queuePeerMessage(incoming, { type: 'notice', message: 'Connected, but this phone could not be saved as a trusted device.' } satisfies HostMessage);
                 }
               }
               if (disposed || connectionRef.current !== incoming) return;
               const capabilities = capabilitiesFor(securityRef.current);
-              void incoming.send({
+              queuePeerMessage(incoming, {
                 type: 'ready',
                 computerName,
                 jigglerEnabled: jigglerRef.current,
@@ -630,7 +646,11 @@ export function HostController() {
       });
 
       sourcePeer.on('open', () => {
-        if (disposed || connectionRef.current?.open) return;
+        if (disposed) return;
+        if (connectionRef.current?.open) {
+          if (!callRef.current && !capturePendingRef.current) void shareScreenRef.current?.();
+          return;
+        }
         setHostState('ready');
         setNotice('Waiting for your phone');
       });
@@ -642,7 +662,7 @@ export function HostController() {
         }
         window.setTimeout(() => {
           if (!disposed && sourcePeer.disconnected && !sourcePeer.destroyed) sourcePeer.reconnect();
-        }, 1200);
+        }, SIGNALING_RECONNECT_DELAY_MS);
       });
       sourcePeer.on('error', (error) => {
         if (disposed) return;
@@ -679,6 +699,7 @@ export function HostController() {
       window.clearTimeout(startupTimer);
       shareScreenRef.current = null;
       capturePendingRef.current = false;
+      captureQueuedRef.current = false;
       stopStream();
       connectionRef.current?.close();
       connectionRef.current = null;

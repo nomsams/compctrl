@@ -73,7 +73,16 @@ import { Input } from '@/components/ui/input';
 import { Slider } from '@/components/ui/slider';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import {
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TIMEOUT_MS,
+  RESUME_PROBE_TIMEOUT_MS,
+  SIGNALING_RECONNECT_DELAY_MS,
+  pongMissed,
+  reconnectDelayMs,
+} from '@/lib/connection-reliability';
 import { newPeer } from '@/lib/peer';
+import { queuePeerMessage, sendPeerMessage } from '@/lib/peer-transport';
 import { uploadDictationAudio } from '@/lib/dictation-transfer';
 import {
   MAX_VIEW_SCALE,
@@ -329,10 +338,7 @@ export function RemoteController() {
   }, []);
 
   const send = useCallback((message: ControllerMessage) => {
-    const connection = connectionRef.current;
-    if (!connection?.open) return false;
-    void connection.send(message);
-    return true;
+    return queuePeerMessage(connectionRef.current, message);
   }, []);
 
   const settleDisplayState = useCallback((blanked: boolean, requestId?: string) => {
@@ -425,10 +431,7 @@ export function RemoteController() {
           if (!audio.length) throw new Error('No audio was recorded.');
           if (audio.length > 20 * 1024 * 1024) throw new Error('Recording is too large. Keep dictation under 90 seconds.');
           await uploadDictationAudio(audio, id, async (message) => {
-            const connection = connectionRef.current;
-            if (!connection?.open) return false;
-            await connection.send(message);
-            return connection.open;
+            return sendPeerMessage(connectionRef.current, message);
           });
         })().catch((error) => {
           send({ type: 'dictation-cancel', id });
@@ -527,6 +530,9 @@ export function RemoteController() {
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
     let mediaRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let connectionDeadline: ReturnType<typeof setTimeout> | null = null;
+    let resumeProbeTimer: ReturnType<typeof setTimeout> | null = null;
+    let resumeProbeSentAt = 0;
+    let signalingReconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let peer: ReturnType<typeof newPeer> | null = null;
     let connection: DataConnection | null = null;
     let transportGeneration = 0;
@@ -552,6 +558,11 @@ export function RemoteController() {
     const cleanTransport = () => {
       if (connectionDeadline) clearTimeout(connectionDeadline);
       connectionDeadline = null;
+      if (resumeProbeTimer) clearTimeout(resumeProbeTimer);
+      resumeProbeTimer = null;
+      resumeProbeSentAt = 0;
+      if (signalingReconnectTimer) clearTimeout(signalingReconnectTimer);
+      signalingReconnectTimer = null;
       const recorder = recorderRef.current;
       if (recorder?.state === 'recording') {
         recorder.onstop = null;
@@ -585,7 +596,7 @@ export function RemoteController() {
       setHostNotice(navigator.onLine ? 'Control connection lost. Reconnecting…' : 'Phone is offline.');
       streamRef.current = null;
       setStream(null);
-      const delay = navigator.onLine ? Math.min(1000 * 2 ** attempt, 8000) : 2500;
+      const delay = reconnectDelayMs(attempt, navigator.onLine);
       attempt += 1;
       setRetryCount(attempt);
       retryTimer = setTimeout(() => {
@@ -654,7 +665,7 @@ export function RemoteController() {
                 : authProofForCode(sessionCode, message.challenge, nonce);
               void proofPromise.then((proof) => {
                 if (!disposed && activeConnection.open && currentGeneration === transportGeneration) {
-                  void activeConnection.send({
+                  queuePeerMessage(activeConnection, {
                     type: 'auth-response',
                     method: authMode,
                     challenge: message.challenge,
@@ -721,7 +732,7 @@ export function RemoteController() {
                 window.localStorage.setItem(trustedStorageKey(sessionCode), JSON.stringify(trustedCredential));
                 setTrustedDevice(true);
                 if (message.requiresAck) {
-                  void activeConnection.send({
+                  queuePeerMessage(activeConnection, {
                     type: 'trusted-credential-ack',
                     deviceId: message.deviceId,
                   } satisfies ControllerMessage);
@@ -766,6 +777,11 @@ export function RemoteController() {
               }
             } else if (message.type === 'pong') {
               lastPongRef.current = Date.now();
+              if (resumeProbeTimer && message.sentAt >= resumeProbeSentAt) {
+                clearTimeout(resumeProbeTimer);
+                resumeProbeTimer = null;
+                resumeProbeSentAt = 0;
+              }
             } else if (message.type === 'notice') {
               setHostNotice(message.message);
             } else if (message.type === 'display-result') {
@@ -806,6 +822,7 @@ export function RemoteController() {
         }, 12_000);
         let remoteVideoTrack: MediaStreamTrack | null = null;
         let statsTimer = 0;
+        let muteTimer = 0;
         const statsStartedAt = Date.now();
         const inspectMediaTransport = async () => {
           if (callRef.current !== incomingCall) return;
@@ -813,6 +830,7 @@ export function RemoteController() {
           const iceState = peerConnection?.iceConnectionState ?? 'unknown';
           if (iceState === 'failed') {
             setMediaDiagnostic('The video connection failed while the mouse connection remained active. Check that both devices are on the same Wi-Fi, then restart the screen stream.');
+            incomingCall.close();
             return;
           }
           if (!peerConnection || Date.now() - statsStartedAt < 5_000) return;
@@ -845,12 +863,27 @@ export function RemoteController() {
         const markMediaLive = () => {
           if (callRef.current !== incomingCall) return;
           window.clearTimeout(streamTimeout);
+          window.clearTimeout(muteTimer);
+          muteTimer = 0;
           setHostNotice('');
+        };
+        const handleMediaMute = () => {
+          if (callRef.current !== incomingCall) return;
+          setHostNotice('Desktop video paused. Waiting briefly for it to resume…');
+          window.clearTimeout(muteTimer);
+          muteTimer = window.setTimeout(() => {
+            if (callRef.current === incomingCall && remoteVideoTrack?.muted && document.visibilityState === 'visible') {
+              setHostNotice('Desktop video stayed paused. Restarting the media path…');
+              incomingCall.close();
+            }
+          }, 6_000);
         };
         const recoverMedia = () => {
           window.clearTimeout(streamTimeout);
           window.clearInterval(statsTimer);
+          window.clearTimeout(muteTimer);
           remoteVideoTrack?.removeEventListener('unmute', markMediaLive);
+          remoteVideoTrack?.removeEventListener('mute', handleMediaMute);
           remoteVideoTrack?.removeEventListener('ended', recoverMedia);
           if (callRef.current !== incomingCall) return;
           callRef.current = null;
@@ -879,9 +912,11 @@ export function RemoteController() {
           streamRef.current = remoteStream;
           setStream(remoteStream);
           remoteVideoTrack.addEventListener('ended', recoverMedia, { once: true });
+          remoteVideoTrack.addEventListener('mute', handleMediaMute);
+          remoteVideoTrack.addEventListener('unmute', markMediaLive);
           if (remoteVideoTrack.muted) {
             setHostNotice('Connected. Waiting for the first desktop frame…');
-            remoteVideoTrack.addEventListener('unmute', markMediaLive, { once: true });
+            handleMediaMute();
           } else {
             markMediaLive();
           }
@@ -890,20 +925,45 @@ export function RemoteController() {
         incomingCall.on('error', recoverMedia);
       });
 
-      activePeer.on('disconnected', () => scheduleReconnect(currentGeneration));
+      const restoreSignaling = () => {
+        signalingReconnectTimer = null;
+        if (disposed || currentGeneration !== transportGeneration || activePeer.destroyed || !activePeer.disconnected) return;
+        try { activePeer.reconnect(); } catch { scheduleReconnect(currentGeneration); }
+      };
+      activePeer.on('disconnected', () => {
+        if (disposed || currentGeneration !== transportGeneration) return;
+        // PeerJS signaling is only the rendezvous. Do not tear down a healthy
+        // direct data/media session just because its WebSocket briefly drops.
+        if (connectionRef.current?.open) {
+          if (signalingReconnectTimer) clearTimeout(signalingReconnectTimer);
+          signalingReconnectTimer = setTimeout(restoreSignaling, SIGNALING_RECONNECT_DELAY_MS);
+          return;
+        }
+        scheduleReconnect(currentGeneration);
+      });
       activePeer.on('close', () => scheduleReconnect(currentGeneration));
-      activePeer.on('error', () => scheduleReconnect(currentGeneration));
+      activePeer.on('error', () => {
+        if (connectionRef.current?.open) {
+          if (activePeer.disconnected && !signalingReconnectTimer) {
+            signalingReconnectTimer = setTimeout(restoreSignaling, SIGNALING_RECONNECT_DELAY_MS);
+          }
+          return;
+        }
+        scheduleReconnect(currentGeneration);
+      });
     };
 
     connect();
     const heartbeat = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      if (resumeProbeTimer) return;
       if (!connectionRef.current?.open) return;
-      if (Date.now() - lastPongRef.current > 25_000) {
+      if (Date.now() - lastPongRef.current > HEARTBEAT_TIMEOUT_MS) {
         scheduleReconnect();
         return;
       }
       send({ type: 'ping', sentAt: Date.now() });
-    }, 8000);
+    }, HEARTBEAT_INTERVAL_MS);
 
     const reconnectWhenOnline = () => {
       if (!disposed && !connectionRef.current?.open) {
@@ -922,9 +982,21 @@ export function RemoteController() {
       if (connectionRef.current?.open) {
         if (retryTimer) clearTimeout(retryTimer);
         retryTimer = null;
-        lastPongRef.current = Date.now();
         setConnectionState('connected');
-        send({ type: 'ping', sentAt: Date.now() });
+        if (resumeProbeTimer) clearTimeout(resumeProbeTimer);
+        resumeProbeSentAt = Date.now();
+        if (!send({ type: 'ping', sentAt: resumeProbeSentAt })) {
+          scheduleReconnect();
+          return;
+        }
+        resumeProbeTimer = setTimeout(() => {
+          resumeProbeTimer = null;
+          if (pongMissed(resumeProbeSentAt, lastPongRef.current)) {
+            setHostNotice('The previous phone connection expired in the background. Reconnecting…');
+            scheduleReconnect();
+          }
+          resumeProbeSentAt = 0;
+        }, RESUME_PROBE_TIMEOUT_MS);
         if (!callRef.current) send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabledRef.current });
         return;
       }
@@ -939,6 +1011,8 @@ export function RemoteController() {
       window.clearInterval(heartbeat);
       if (retryTimer) clearTimeout(retryTimer);
       if (mediaRetryTimer) clearTimeout(mediaRetryTimer);
+      if (resumeProbeTimer) clearTimeout(resumeProbeTimer);
+      if (signalingReconnectTimer) clearTimeout(signalingReconnectTimer);
       window.removeEventListener('online', reconnectWhenOnline);
       document.removeEventListener('visibilitychange', resumeWhenVisible);
       window.removeEventListener('pageshow', resumeWhenVisible);
@@ -1222,6 +1296,7 @@ function RemoteSurface({
   const stageRef = useRef<HTMLDivElement>(null);
   const magnifierCanvasRef = useRef<HTMLCanvasElement>(null);
   const lastRenderedFrameRef = useRef(0);
+  const blackFrameRecoveryAttemptedRef = useRef(false);
   const keyboardInputRef = useRef<HTMLInputElement>(null);
   const quickKeyboardInputRef = useRef<HTMLInputElement>(null);
   const inputHistoryRef = useRef(new WeakMap<HTMLInputElement, string>());
@@ -1400,8 +1475,27 @@ function RemoteSurface({
   }, [measureStage, stream]);
 
   useEffect(() => {
+    if (!stream) return;
+    const resumePlayback = () => {
+      if (document.visibilityState !== 'visible') return;
+      const video = videoRef.current;
+      if (!video) return;
+      if (video.srcObject !== stream) video.srcObject = stream;
+      void video.play().then(() => setVideoReady(true)).catch(() => setVideoReady(false));
+    };
+    document.addEventListener('visibilitychange', resumePlayback);
+    window.addEventListener('pageshow', resumePlayback);
+    window.addEventListener('focus', resumePlayback);
+    return () => {
+      document.removeEventListener('visibilitychange', resumePlayback);
+      window.removeEventListener('pageshow', resumePlayback);
+      window.removeEventListener('focus', resumePlayback);
+    };
+  }, [stream]);
+
+  useEffect(() => {
     const video = videoRef.current;
-    if (!video || !stream) {
+    if (!video || !stream || screenBlanked) {
       setBlackFrameDetected(false);
       return;
     }
@@ -1421,9 +1515,20 @@ function RemoteSurface({
         }
         if (signaledPixels < pixels.length / 400) {
           consecutiveBlackFrames += 1;
-          if (consecutiveBlackFrames >= 3) setBlackFrameDetected(true);
+          if (consecutiveBlackFrames >= 4) {
+            setBlackFrameDetected(true);
+            if (
+              !screenBlanked && connectionState === 'connected'
+              && !blackFrameRecoveryAttemptedRef.current
+            ) {
+              blackFrameRecoveryAttemptedRef.current = true;
+              setVideoReady(false);
+              send({ type: 'stream', action: 'request', systemAudio: systemAudioEnabled });
+            }
+          }
         } else {
           consecutiveBlackFrames = 0;
+          blackFrameRecoveryAttemptedRef.current = false;
           setBlackFrameDetected(false);
         }
       } catch {
@@ -1432,7 +1537,7 @@ function RemoteSurface({
     };
     const timer = window.setInterval(inspectFrame, 1_500);
     return () => window.clearInterval(timer);
-  }, [stream]);
+  }, [connectionState, screenBlanked, send, stream, systemAudioEnabled]);
 
   useEffect(() => {
     const video = videoRef.current;
