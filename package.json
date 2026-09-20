@@ -1,7 +1,7 @@
 {
   "name": "compctrl",
   "productName": "CompCtrl",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Peer-to-peer phone controller for Windows",
   "author": "CompCtrl contributors",
   "private": true,
@@ -20,6 +20,7 @@
     "test:geometry": "node --experimental-strip-types --test lib/*.test.ts companion/*.test.cjs",
     "test:capture:windows": "electron scripts/capture-smoke.cjs --disable-wgc --strict-permissions --webrtc-loopback",
     "test:rendezvous": "electron scripts/rendezvous-smoke.cjs",
+    "test:installed-session": "electron scripts/installed-session-smoke.cjs",
     "lint": "oxlint app lib",
     "format": "oxfmt"
   },

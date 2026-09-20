@@ -110,6 +110,8 @@ import {
   createSecurityToken,
   isCompatibleProtocol,
   isHostMessage,
+  isValidPeerId,
+  legacyPeerIdForCode,
   pairingCodeFromQr,
   peerIdForCode,
 } from '@/lib/protocol';
@@ -221,6 +223,7 @@ function getOrCreateDeviceId() {
 
 function controllerDeviceName() {
   const agent = navigator.userAgent;
+  if (/CompCtrlSmoke/i.test(agent)) return 'CompCtrl test probe';
   if (/iPhone/i.test(agent)) return 'iPhone';
   if (/iPad/i.test(agent)) return 'iPad';
   if (/Android/i.test(agent)) return /Mobile/i.test(agent) ? 'Android phone' : 'Android tablet';
@@ -537,7 +540,7 @@ export function RemoteController() {
     let connection: DataConnection | null = null;
     let transportGeneration = 0;
     let trustedCredential = readTrustedCredential(sessionCode);
-    if (trustedCredential && trustedCredential.deviceId !== deviceIdRef.current) {
+    if (trustedCredential && (trustedCredential.deviceId !== deviceIdRef.current || !isValidPeerId(trustedCredential.hostId))) {
       window.localStorage.removeItem(trustedStorageKey(sessionCode));
       trustedCredential = null;
     }
@@ -618,17 +621,30 @@ export function RemoteController() {
       activePeer.on('open', () => {
         if (disposed || currentGeneration !== transportGeneration) return;
         const credential = trustedCredential;
-        // A stale trusted rendezvous used to trap the controller forever. Every
-        // third connection attempt also tries the QR-code rendezvous, while
-        // retaining the trusted credential in case the outage is temporary.
-        const useTrustedCredential = Boolean(credential) && attempt % 3 !== 2;
+        // Try a trusted route once, then both current and legacy QR routes.
+        // The old Base64URL rendezvous can be invalid under PeerJS's ID grammar,
+        // so it is used only when the generated value is accepted by PeerJS.
+        const trustedRouteSlot = credential ? attempt % 3 : -1;
+        const useTrustedCredential = Boolean(credential) && trustedRouteSlot === 0;
         const authMode = useTrustedCredential ? 'trusted' as const : 'code' as const;
-        const connectionProtocol = credential ? PROTOCOL_VERSION : (attempt % 2 === 0 ? PROTOCOL_VERSION : 2);
-        const hostIdPromise = useTrustedCredential && credential ? Promise.resolve(credential.hostId) : peerIdForCode(sessionCode);
+        const codeAttempt = credential
+          ? Math.floor(attempt / 3) * 2 + Math.max(0, trustedRouteSlot - 1)
+          : attempt;
+        const routePromise = useTrustedCredential && credential
+          ? Promise.resolve({ hostId: credential.hostId, protocol: PROTOCOL_VERSION })
+          : Promise.all([peerIdForCode(sessionCode), legacyPeerIdForCode(sessionCode)]).then(([hostId, legacyHostId]) => {
+              const routes = [
+                { hostId, protocol: PROTOCOL_VERSION },
+                ...(isValidPeerId(legacyHostId) ? [{ hostId: legacyHostId, protocol: PROTOCOL_VERSION }] : []),
+                { hostId, protocol: 2 },
+                ...(isValidPeerId(legacyHostId) ? [{ hostId: legacyHostId, protocol: 2 }] : []),
+              ];
+              return routes[codeAttempt % routes.length];
+            });
         if (credential && !useTrustedCredential) {
           setHostNotice('Saved connection unavailable. Trying the QR-code rendezvous…');
         }
-        void hostIdPromise.then((hostId) => {
+        void routePromise.then(({ hostId, protocol: connectionProtocol }) => {
           if (disposed || activePeer.destroyed || currentGeneration !== transportGeneration) return;
           const activeConnection = activePeer.connect(hostId, {
             reliable: true,
@@ -942,12 +958,20 @@ export function RemoteController() {
         scheduleReconnect(currentGeneration);
       });
       activePeer.on('close', () => scheduleReconnect(currentGeneration));
-      activePeer.on('error', () => {
+      activePeer.on('error', (error) => {
         if (connectionRef.current?.open) {
           if (activePeer.disconnected && !signalingReconnectTimer) {
             signalingReconnectTimer = setTimeout(restoreSignaling, SIGNALING_RECONNECT_DELAY_MS);
           }
           return;
+        }
+        const errorType = typeof error?.type === 'string' ? error.type : 'unknown';
+        if (errorType === 'peer-unavailable') {
+          setHostNotice('That rendezvous route is unavailable. Trying the next compatible route…');
+        } else if (errorType === 'network' || errorType === 'socket-error' || errorType === 'socket-closed') {
+          setHostNotice('The rendezvous service is temporarily unreachable. Retrying…');
+        } else {
+          setHostNotice(`Connection setup failed (${errorType}). Retrying…`);
         }
         scheduleReconnect(currentGeneration);
       });
@@ -2153,7 +2177,7 @@ function RemoteSurface({
           <span className="remote-empty">
             {connected ? <Monitor className="size-8" /> : <WifiOff className="size-8" />}
             <strong>{connected ? 'Starting live screen…' : 'Finding your computer…'}</strong>
-            <span>{connected ? hostNotice || 'The companion is preparing the display.' : 'We will reconnect automatically when it is available.'}</span>
+            <span>{connected ? hostNotice || 'The companion is preparing the display.' : hostNotice || 'We will reconnect automatically when it is available.'}</span>
             {!connected && <span className="retry-note"><RefreshCw /> Retrying automatically</span>}
           </span>
         )}

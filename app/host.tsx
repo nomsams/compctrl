@@ -43,6 +43,8 @@ import {
   createSecurityToken,
   isCompatibleProtocol,
   isControllerMessage,
+  isValidPeerId,
+  legacyPeerIdForCode,
   peerIdForCode,
 } from '@/lib/protocol';
 
@@ -88,6 +90,7 @@ export function HostController() {
   const [hostState, setHostState] = useState<HostState>('starting');
   const [pairingCode, setPairingCode] = useState('');
   const [hostPeerId, setHostPeerId] = useState('');
+  const [legacyHostPeerId, setLegacyHostPeerId] = useState('');
   const [trustedPeerId, setTrustedPeerId] = useState('');
   const [trustedDevices, setTrustedDevices] = useState<Array<{ id: string; name: string; createdAt: number; lastSeenAt: number }>>([]);
   const [computerName, setComputerName] = useState('Windows PC');
@@ -136,11 +139,17 @@ export function HostController() {
   useEffect(() => {
     if (!pairingCode) {
       setHostPeerId('');
+      setLegacyHostPeerId('');
       return;
     }
     let disposed = false;
     setHostPeerId('');
-    void peerIdForCode(pairingCode).then((id) => { if (!disposed) setHostPeerId(id); });
+    setLegacyHostPeerId('');
+    void Promise.all([peerIdForCode(pairingCode), legacyPeerIdForCode(pairingCode)]).then(([id, legacyId]) => {
+      if (disposed) return;
+      setHostPeerId(id);
+      setLegacyHostPeerId(isValidPeerId(legacyId) && legacyId !== id ? legacyId : '');
+    });
     return () => { disposed = true; };
   }, [pairingCode]);
 
@@ -344,6 +353,7 @@ export function HostController() {
     if (!api || !pairingCode || !hostPeerId || !trustedPeerId) return;
     let disposed = false;
     let pairingPeer: ReturnType<typeof newPeer> | null = null;
+    let legacyPairingPeer: ReturnType<typeof newPeer> | null = null;
     let trustedPeer: ReturnType<typeof newPeer> | null = null;
     const pendingConnections = new Set<DataConnection>();
     let authenticationClaimed = false;
@@ -437,7 +447,7 @@ export function HostController() {
       }
     };
 
-    const acceptConnections = (sourcePeer: ReturnType<typeof newPeer>, mode: 'code' | 'trusted') => {
+    const acceptConnections = (sourcePeer: ReturnType<typeof newPeer>, mode: 'code' | 'trusted', primaryPairingRoute = false) => {
       sourcePeer.on('connection', (incoming) => {
         const metadata = incoming.metadata as {
           role?: string;
@@ -651,12 +661,13 @@ export function HostController() {
           if (!callRef.current && !capturePendingRef.current) void shareScreenRef.current?.();
           return;
         }
+        if (!primaryPairingRoute) return;
         setHostState('ready');
         setNotice('Waiting for your phone');
       });
       sourcePeer.on('disconnected', () => {
         if (disposed) return;
-        if (!connectionRef.current?.open) {
+        if (primaryPairingRoute && !connectionRef.current?.open) {
           setHostState('reconnecting');
           setNotice('Rendezvous interrupted — reconnecting…');
         }
@@ -666,15 +677,15 @@ export function HostController() {
       });
       sourcePeer.on('error', (error) => {
         if (disposed) return;
-        if (error.type === 'unavailable-id' && mode === 'code') {
+        if (error.type === 'unavailable-id' && primaryPairingRoute) {
           const replacement = createPairingCode();
           setPairingCode(replacement);
           void api.saveSettings({ pairingCode: replacement });
           return;
         }
-        if (!connectionRef.current?.open) {
+        if (primaryPairingRoute && !connectionRef.current?.open) {
           setHostState('error');
-          setNotice(mode === 'trusted' ? 'Trusted-device rendezvous failed. Restart the companion.' : 'Could not reach the P2P rendezvous. Retrying…');
+          setNotice(`Could not open the QR rendezvous (${error.type || 'unknown error'}). Retrying…`);
         }
         window.setTimeout(() => {
           if (!disposed && sourcePeer.disconnected && !sourcePeer.destroyed) sourcePeer.reconnect();
@@ -690,7 +701,11 @@ export function HostController() {
       trustedPeer = newPeer(trustedPeerId);
       peerRef.current = pairingPeer;
       trustedPeerRef.current = trustedPeer;
-      acceptConnections(pairingPeer, 'code');
+      acceptConnections(pairingPeer, 'code', true);
+      if (legacyHostPeerId) {
+        legacyPairingPeer = newPeer(legacyHostPeerId);
+        acceptConnections(legacyPairingPeer, 'code');
+      }
       acceptConnections(trustedPeer, 'trusted');
     }, 250);
 
@@ -704,11 +719,12 @@ export function HostController() {
       connectionRef.current?.close();
       connectionRef.current = null;
       if (pairingPeer && !pairingPeer.destroyed) pairingPeer.destroy();
+      if (legacyPairingPeer && !legacyPairingPeer.destroyed) legacyPairingPeer.destroy();
       if (trustedPeer && !trustedPeer.destroyed) trustedPeer.destroy();
       peerRef.current = null;
       trustedPeerRef.current = null;
     };
-  }, [api, computerName, handleControllerMessage, hostPeerId, pairingCode, send, stopStream, trustedPeerId]);
+  }, [api, computerName, handleControllerMessage, hostPeerId, legacyHostPeerId, pairingCode, send, stopStream, trustedPeerId]);
 
   const pairingUrl = useMemo(() => {
     const base = normalizeControllerUrl(controllerUrl);

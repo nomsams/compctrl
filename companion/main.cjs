@@ -29,6 +29,7 @@ const {
   normalizeSecuritySettings,
   trustedDeviceExpiry,
 } = require('./security.cjs');
+const { generateTrustedPeerId, isStoredTrustedPeerId } = require('./peer-identity.cjs');
 
 // Desktop capture and WebRTC encoding should use the GPU by default. Forcing
 // software rendering can produce valid local pixels but black encoded frames
@@ -76,10 +77,6 @@ let displayCaptureAuthorization = null;
 
 function generateCode() {
   return Array.from(crypto.randomBytes(CODE_LENGTH), (byte) => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
-}
-
-function generateTrustedPeerId() {
-  return `compctrl-trusted-v1-${crypto.randomBytes(24).toString('base64url').slice(0, 32)}`;
 }
 
 function normalizeTrustedDevices(value) {
@@ -144,7 +141,7 @@ function readSettings() {
       jigglerEnabled: stored.jigglerEnabled === true,
       autoStart: stored.autoStart !== false,
       groqApiKeyProtected: typeof stored.groqApiKeyProtected === 'string' ? stored.groqApiKeyProtected : '',
-      trustedPeerId: typeof stored.trustedPeerId === 'string' && /^compctrl-trusted-v1-[A-Za-z0-9_-]{32}$/.test(stored.trustedPeerId)
+      trustedPeerId: isStoredTrustedPeerId(stored.trustedPeerId)
         ? stored.trustedPeerId
         : defaults.trustedPeerId,
       trustedDevices: normalizeTrustedDevices(stored.trustedDevices),

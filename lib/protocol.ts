@@ -127,6 +127,14 @@ function bytesToBase64Url(bytes: Uint8Array) {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+function bytesToHex(bytes: Uint8Array) {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export function isValidPeerId(value: string) {
+  return /^[A-Za-z0-9]+(?:[ _-][A-Za-z0-9]+)*$/.test(value);
+}
+
 export function cleanCode(value: string) {
   return value.toUpperCase().replace(/[^A-Z2-9]/g, '').slice(0, CODE_LENGTH);
 }
@@ -156,6 +164,11 @@ export function createSecurityToken(byteLength = 24) {
 }
 
 export async function peerIdForCode(code: string) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`compctrl-rendezvous-v2:${cleanCode(code)}`));
+  return `compctrl-v3-${bytesToHex(new Uint8Array(digest)).slice(0, 40)}`;
+}
+
+export async function legacyPeerIdForCode(code: string) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`compctrl-rendezvous-v2:${cleanCode(code)}`));
   return `compctrl-v2-${bytesToBase64Url(new Uint8Array(digest)).slice(0, 32)}`;
 }

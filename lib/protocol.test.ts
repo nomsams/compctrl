@@ -9,6 +9,8 @@ import {
   isCompatibleProtocol,
   isControllerMessage,
   isHostMessage,
+  isValidPeerId,
+  legacyPeerIdForCode,
   peerIdForCode,
 } from './protocol.ts';
 
@@ -19,6 +21,18 @@ void test('creates stronger pairing codes and hides them from the rendezvous id'
   const peerId = await peerIdForCode(code);
   assert.equal(peerId, await peerIdForCode(code));
   assert.equal(peerId.includes(code.toLowerCase()), false);
+  assert.equal(isValidPeerId(peerId), true);
+  assert.match(peerId, /^compctrl-v3-[a-f0-9]{40}$/);
+});
+
+void test('all generated pairing rendezvous IDs satisfy the PeerJS grammar', async () => {
+  let invalidLegacyIds = 0;
+  for (let index = 0; index < 256; index += 1) {
+    const code = createPairingCode();
+    assert.equal(isValidPeerId(await peerIdForCode(code)), true);
+    if (!isValidPeerId(await legacyPeerIdForCode(code))) invalidLegacyIds += 1;
+  }
+  assert.ok(invalidLegacyIds > 0, 'The regression sample should include rejected Base64URL legacy IDs.');
 });
 
 void test('binds authentication proofs to a fresh challenge and nonce', async () => {

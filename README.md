@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.6-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.7-x64.exe
 ```
 
 ## Controls
@@ -71,6 +71,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 
 - The Windows companion is required. Normal web pages are deliberately prevented from controlling the operating system or capturing the desktop unattended.
 - Pairing codes use an unambiguous 32-character alphabet and provide about 60 bits of entropy. The public rendezvous identifier is a one-way SHA-256 derivative rather than the code itself, and every connection must answer a fresh HMAC-SHA-256 challenge before it can receive video or send controls. Trusted reconnect uses a rotating random 256-bit credential, encrypted at rest on Windows with `safeStorage`; a successfully used phone token immediately becomes invalid.
+- Rendezvous identifiers use a hexadecimal SHA-256 derivative that always satisfies PeerJS's identifier grammar. The companion also listens on a valid legacy route during upgrades, and it reports **Ready** only after the current QR route is registered.
 - Sensitive features are least-privilege and controlled only from the Windows companion. Clipboard transfer, display power, Groq dictation, system audio, and restart/shutdown start disabled. Mouse and keyboard can be disabled while the live screen remains connected in view-only mode.
 - Only one recently active controller can hold a session. A second phone receives a busy response instead of displacing the first. **Emergency lockdown** (or **Ctrl+Alt+Shift+F11**) disconnects controllers, revokes every trusted phone, rotates the pairing and rendezvous identities, restores displays, releases held mouse/modifier buttons, and disables remote input.
 - The companion replaces its QR code and pairing details with a connected-session notice as soon as a phone authenticates. It deliberately remains visible because Windows capture-exclusion and hidden-window modes can produce black desktop frames on some systems. Permission changes and trusted-phone revocation are locked while a controller is connected.
