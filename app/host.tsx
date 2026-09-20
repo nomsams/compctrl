@@ -7,6 +7,8 @@ import {
   Check,
   CircleHelp,
   Copy,
+  Cpu,
+  Download,
   EyeOff,
   ExternalLink,
   Laptop,
@@ -27,6 +29,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { recordingChunksToLocalWhisperWav } from '@/lib/audio-wav';
 import { SIGNALING_RECONNECT_DELAY_MS, shouldRejectControllerTakeover } from '@/lib/connection-reliability';
 import { newPeer } from '@/lib/peer';
 import { queuePeerMessage } from '@/lib/peer-transport';
@@ -49,6 +52,15 @@ import {
 } from '@/lib/protocol';
 
 type HostState = 'starting' | 'ready' | 'connected' | 'reconnecting' | 'error';
+type TranscriptionProvider = 'groq' | 'local';
+type LocalWhisperStatus = { installed: boolean; modelName: string; modelSizeMb: number; build: string };
+
+const EMPTY_LOCAL_WHISPER: LocalWhisperStatus = {
+  installed: false,
+  modelName: 'Whisper tiny multilingual Q5_1',
+  modelSizeMb: 32.2,
+  build: '',
+};
 
 const DEFAULT_SECURITY_SETTINGS: SecuritySettings = {
   remoteInputEnabled: true,
@@ -101,6 +113,10 @@ export function HostController() {
   const [autoStart, setAutoStart] = useState(true);
   const [groqKeyConfigured, setGroqKeyConfigured] = useState(false);
   const [groqKeyDraft, setGroqKeyDraft] = useState('');
+  const [transcriptionProvider, setTranscriptionProvider] = useState<TranscriptionProvider>('groq');
+  const [transcriptionReady, setTranscriptionReady] = useState(false);
+  const [localWhisper, setLocalWhisper] = useState<LocalWhisperStatus>(EMPTY_LOCAL_WHISPER);
+  const [localWhisperInstalling, setLocalWhisperInstalling] = useState(false);
   const [security, setSecurity] = useState<SecuritySettings>(DEFAULT_SECURITY_SETTINGS);
   const [controllerName, setControllerName] = useState('Phone');
   const [copied, setCopied] = useState(false);
@@ -108,6 +124,8 @@ export function HostController() {
   const jigglerRef = useRef(false);
   const screenBlankedRef = useRef(false);
   const groqKeyConfiguredRef = useRef(false);
+  const transcriptionProviderRef = useRef<TranscriptionProvider>('groq');
+  const transcriptionReadyRef = useRef(false);
   const securityRef = useRef<SecuritySettings>(DEFAULT_SECURITY_SETTINGS);
   const dictationsRef = useRef(new Map<string, { mimeType: string; chunks: Map<number, string>; encodedBytes: number }>());
   const connectionRef = useRef<DataConnection | null>(null);
@@ -134,6 +152,8 @@ export function HostController() {
   useEffect(() => { jigglerRef.current = jigglerEnabled; }, [jigglerEnabled]);
   useEffect(() => { screenBlankedRef.current = screenBlanked; }, [screenBlanked]);
   useEffect(() => { groqKeyConfiguredRef.current = groqKeyConfigured; }, [groqKeyConfigured]);
+  useEffect(() => { transcriptionProviderRef.current = transcriptionProvider; }, [transcriptionProvider]);
+  useEffect(() => { transcriptionReadyRef.current = transcriptionReady; }, [transcriptionReady]);
   useEffect(() => { securityRef.current = security; }, [security]);
 
   useEffect(() => {
@@ -163,7 +183,7 @@ export function HostController() {
       type: 'status',
       jigglerEnabled: jigglerRef.current,
       screenBlanked: screenBlankedRef.current,
-      dictationAvailable: groqKeyConfiguredRef.current && capabilities.dictation,
+      dictationAvailable: transcriptionReadyRef.current && capabilities.dictation,
       capabilities,
     });
   }, [send]);
@@ -204,8 +224,8 @@ export function HostController() {
       return;
     }
     if (message.type === 'dictation-start') {
-      if (!securityRef.current.dictationEnabled || !groqKeyConfiguredRef.current) {
-        send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Add a Groq API key in the Windows companion first.' });
+      if (!securityRef.current.dictationEnabled || !transcriptionReadyRef.current) {
+        send({ type: 'dictation-status', id: message.id, status: 'error', message: 'Configure the selected transcription provider in the Windows companion first.' });
         return;
       }
       dictationsRef.current.clear();
@@ -241,9 +261,13 @@ export function HostController() {
         return;
       }
       dictationsRef.current.delete(message.id);
-      send({ type: 'dictation-status', id: message.id, status: 'transcribing', message: 'Groq is transcribing…' });
+      const usingLocalWhisper = transcriptionProviderRef.current === 'local';
+      send({ type: 'dictation-status', id: message.id, status: 'transcribing', message: usingLocalWhisper ? 'Local Whisper is transcribing…' : 'Groq is transcribing…' });
       try {
-        const transcript = await api.transcribeAudio(chunks, recording.mimeType);
+        const transcriptionChunks = usingLocalWhisper
+          ? await recordingChunksToLocalWhisperWav(chunks)
+          : chunks;
+        const transcript = await api.transcribeAudio(transcriptionChunks, usingLocalWhisper ? 'audio/wav' : recording.mimeType);
         await api.dispatch({ type: 'text', text: transcript });
         send({ type: 'dictation-status', id: message.id, status: 'done', message: `Inserted ${transcript.length} characters.` });
       } catch (error) {
@@ -316,6 +340,11 @@ export function HostController() {
       setScreenBlanked(settings.screenBlanked);
       setAutoStart(settings.autoStart);
       setGroqKeyConfigured(settings.groqKeyConfigured);
+      setTranscriptionProvider(settings.transcriptionProvider);
+      setTranscriptionReady(settings.transcriptionReady);
+      setLocalWhisper(settings.localWhisper);
+      transcriptionProviderRef.current = settings.transcriptionProvider;
+      transcriptionReadyRef.current = settings.transcriptionReady;
       setTrustedPeerId(settings.trustedPeerId);
       setTrustedDevices(settings.trustedDevices);
       setSecurity(settings.security);
@@ -603,7 +632,7 @@ export function HostController() {
                 computerName,
                 jigglerEnabled: jigglerRef.current,
                 screenBlanked: screenBlankedRef.current,
-                dictationAvailable: groqKeyConfiguredRef.current && capabilities.dictation,
+                dictationAvailable: transcriptionReadyRef.current && capabilities.dictation,
                 protocolVersion: PROTOCOL_VERSION,
                 capabilities,
               } satisfies HostMessage);
@@ -770,6 +799,10 @@ export function HostController() {
       setGroqKeyDraft('');
       setNotice('Groq key encrypted for this Windows account');
       groqKeyConfiguredRef.current = configured;
+      if (transcriptionProviderRef.current === 'groq') {
+        transcriptionReadyRef.current = configured;
+        setTranscriptionReady(configured);
+      }
       sendStatus();
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not save the Groq key');
@@ -781,9 +814,67 @@ export function HostController() {
     await api.setGroqApiKey('');
     setGroqKeyConfigured(false);
     groqKeyConfiguredRef.current = false;
+    if (transcriptionProviderRef.current === 'groq') {
+      transcriptionReadyRef.current = false;
+      setTranscriptionReady(false);
+    }
     setGroqKeyDraft('');
     setNotice('Saved Groq key removed');
     sendStatus();
+  };
+
+  const setVoiceProvider = async (provider: TranscriptionProvider) => {
+    if (!api || provider === transcriptionProviderRef.current) return;
+    try {
+      await api.saveSettings({ transcriptionProvider: provider });
+      const ready = provider === 'local' ? localWhisper.installed : groqKeyConfiguredRef.current;
+      transcriptionProviderRef.current = provider;
+      transcriptionReadyRef.current = ready;
+      setTranscriptionProvider(provider);
+      setTranscriptionReady(ready);
+      setNotice(provider === 'local' ? 'Local Whisper selected — voice stays on this computer' : 'Groq selected for voice transcription');
+      sendStatus();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not change the transcription provider');
+    }
+  };
+
+  const installWhisper = async () => {
+    if (!api || localWhisperInstalling) return;
+    setLocalWhisperInstalling(true);
+    setNotice('Downloading and verifying local Whisper…');
+    try {
+      const status = await api.installLocalWhisper();
+      setLocalWhisper(status);
+      if (transcriptionProviderRef.current === 'local') {
+        transcriptionReadyRef.current = status.installed;
+        setTranscriptionReady(status.installed);
+        sendStatus();
+      }
+      setNotice('Local Whisper installed and verified');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not install local Whisper');
+    } finally {
+      setLocalWhisperInstalling(false);
+    }
+  };
+
+  const uninstallWhisper = async () => {
+    if (!api || localWhisperInstalling) return;
+    try {
+      const status = await api.removeLocalWhisper();
+      setLocalWhisper(status);
+      if (transcriptionProviderRef.current === 'local') {
+        transcriptionProviderRef.current = 'groq';
+        transcriptionReadyRef.current = groqKeyConfiguredRef.current;
+        setTranscriptionProvider('groq');
+        setTranscriptionReady(groqKeyConfiguredRef.current);
+      }
+      setNotice('Local Whisper files removed');
+      sendStatus();
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Could not remove local Whisper');
+    }
   };
 
   const updateSecurity = async (key: keyof SecuritySettings, enabled: boolean) => {
@@ -936,7 +1027,7 @@ export function HostController() {
               ['trustedReconnectEnabled', 'Remember trusted phones', 'Rotating credentials expire after 30 days or 7 inactive days'],
               ['clipboardEnabled', 'Clipboard transfer', 'Allows explicit text reads and writes between devices'],
               ['displayControlEnabled', 'Display power', 'Allows the phone to power local monitors off or back on'],
-              ['dictationEnabled', 'Voice dictation', 'Allows phone audio to be sent through the saved Groq key'],
+              ['dictationEnabled', 'Voice dictation', 'Allows phone audio to use the locally selected transcription provider'],
               ['systemAudioEnabled', 'System audio', 'Allows desktop audio to accompany the screen stream'],
               ['powerActionsEnabled', 'Restart and shut down', 'Allows the phone to initiate Windows power actions'],
             ] as Array<[keyof SecuritySettings, string, string]>).map(([key, label, description]) => (
@@ -975,7 +1066,33 @@ export function HostController() {
           </section>
 
           <section className="host-settings-card host-wide-card">
-            <div className="section-heading"><div><h2>Groq voice dictation</h2><p>The key is encrypted locally and used only by this companion for Whisper transcription.</p></div><KeyRound /></div>
+            <div className="section-heading"><div><h2>Voice transcription</h2><p>Choose Groq or an offline lightweight Whisper model running on this computer.</p></div>{transcriptionProvider === 'local' ? <Cpu /> : <KeyRound />}</div>
+            <div className="host-setting-row">
+              <span className="host-setting-icon"><Cpu /></span>
+              <span>
+                <strong>Use local Whisper</strong>
+                <small>{localWhisper.installed ? `${localWhisper.modelName} · ${localWhisper.modelSizeMb} MB · no audio leaves this PC` : `Optional ${localWhisper.modelSizeMb} MB multilingual model · off by default`}</small>
+              </span>
+              <Switch
+                checked={transcriptionProvider === 'local'}
+                disabled={localSettingsLocked || localWhisperInstalling || (!localWhisper.installed && transcriptionProvider !== 'local')}
+                onCheckedChange={(enabled) => void setVoiceProvider(enabled ? 'local' : 'groq')}
+                aria-label="Use local Whisper instead of Groq"
+              />
+            </div>
+            <div className="local-whisper-actions">
+              {!localWhisper.installed ? (
+                <Button variant="outline" disabled={localSettingsLocked || localWhisperInstalling} onClick={() => void installWhisper()}>
+                  <Download /> {localWhisperInstalling ? 'Installing and verifying…' : 'Install local model'}
+                </Button>
+              ) : (
+                <Button variant="outline" disabled={localSettingsLocked || localWhisperInstalling} onClick={() => void uninstallWhisper()}>
+                  <Trash2 /> Remove local model
+                </Button>
+              )}
+              <small>Downloads pinned whisper.cpp files and verifies their SHA-256 checksums before installation.</small>
+            </div>
+            <div className="voice-provider-divider"><span>Groq cloud provider</span></div>
             <div className="secret-setting">
               <Input
                 type="password"
@@ -989,7 +1106,13 @@ export function HostController() {
               <Button onClick={() => void saveGroqKey()} disabled={localSettingsLocked || !groqKeyDraft.trim()}>Save key</Button>
               {groqKeyConfigured && <Button variant="outline" size="icon" disabled={localSettingsLocked} onClick={() => void removeGroqKey()} aria-label="Remove saved Groq API key"><Trash2 /></Button>}
             </div>
-            <p className="host-note"><ShieldCheck /> {groqKeyConfigured ? 'Dictation is ready. Focus a Windows text field, then tap Voice on your phone.' : 'The phone never receives or stores this key.'}</p>
+            <p className="host-note"><ShieldCheck /> {
+              transcriptionReady
+                ? `${transcriptionProvider === 'local' ? 'Local Whisper' : 'Groq'} is ready. Focus a Windows text field, then tap Voice on your phone.`
+                : transcriptionProvider === 'local'
+                  ? 'Install the local model to enable dictation.'
+                  : groqKeyConfigured ? 'Groq is configured.' : 'The phone never receives or stores this key.'
+            }</p>
           </section>
         </div>
 

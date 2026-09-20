@@ -1,4 +1,4 @@
-const CACHE_NAME = 'compctrl-shell-v0.4.7';
+const CACHE_NAME = 'compctrl-shell-v0.5.0';
 const APP_SHELL = ['./', './manifest.webmanifest', './pwa-icon-192.png', './pwa-icon-512.png'];
 
 self.addEventListener('install', (event) => {

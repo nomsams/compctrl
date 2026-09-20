@@ -4,6 +4,8 @@ contextBridge.exposeInMainWorld('compCtrl', {
   getSettings: () => ipcRenderer.invoke('compctrl:get-settings'),
   saveSettings: (settings) => ipcRenderer.invoke('compctrl:save-settings', settings),
   setGroqApiKey: (key) => ipcRenderer.invoke('compctrl:set-groq-api-key', key),
+  installLocalWhisper: () => ipcRenderer.invoke('compctrl:install-local-whisper'),
+  removeLocalWhisper: () => ipcRenderer.invoke('compctrl:remove-local-whisper'),
   transcribeAudio: (chunks, mimeType) => ipcRenderer.invoke('compctrl:transcribe-audio', chunks, mimeType),
   issueTrustedDevice: (deviceId, deviceName) => ipcRenderer.invoke('compctrl:issue-trusted-device', deviceId, deviceName),
   verifyTrustedDevice: (deviceId, challenge, nonce, proof) => ipcRenderer.invoke('compctrl:verify-trusted-device', deviceId, challenge, nonce, proof),

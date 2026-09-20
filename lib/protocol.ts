@@ -3,6 +3,7 @@ export const MIN_COMPATIBLE_PROTOCOL_VERSION = 2;
 export const CODE_LENGTH = 12;
 export const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 export const MAX_DICTATION_CHUNK_LENGTH = 64 * 1024;
+export const MAX_DICTATION_CHUNKS = 2_047;
 export const MAX_TEXT_LENGTH = 8 * 1024;
 export const MAX_CLIPBOARD_TEXT_LENGTH = 64 * 1024;
 
@@ -248,12 +249,12 @@ export function isControllerMessage(value: unknown): value is ControllerMessage 
         && typeof value.mimeType === 'string' && audioMimeTypes.has(value.mimeType.toLowerCase());
     case 'dictation-chunk':
       return typeof value.id === 'string' && dictationIdPattern.test(value.id)
-        && Number.isInteger(value.index) && Number(value.index) >= 0 && Number(value.index) < 2_048
+        && Number.isInteger(value.index) && Number(value.index) >= 0 && Number(value.index) < MAX_DICTATION_CHUNKS
         && typeof value.data === 'string' && value.data.length > 0 && value.data.length <= MAX_DICTATION_CHUNK_LENGTH
         && /^[A-Za-z0-9+/]*={0,2}$/.test(value.data);
     case 'dictation-end':
       return typeof value.id === 'string' && dictationIdPattern.test(value.id)
-        && Number.isInteger(value.totalChunks) && Number(value.totalChunks) >= 1 && Number(value.totalChunks) < 2_048;
+        && Number.isInteger(value.totalChunks) && Number(value.totalChunks) >= 1 && Number(value.totalChunks) <= MAX_DICTATION_CHUNKS;
     case 'dictation-cancel': return typeof value.id === 'string' && dictationIdPattern.test(value.id);
     default: return false;
   }

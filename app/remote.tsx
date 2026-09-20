@@ -83,7 +83,7 @@ import {
 } from '@/lib/connection-reliability';
 import { newPeer } from '@/lib/peer';
 import { queuePeerMessage, sendPeerMessage } from '@/lib/peer-transport';
-import { uploadDictationAudio } from '@/lib/dictation-transfer';
+import { MAX_DICTATION_AUDIO_BYTES, uploadDictationAudio } from '@/lib/dictation-transfer';
 import {
   MAX_VIEW_SCALE,
   clamp,
@@ -304,6 +304,7 @@ export function RemoteController() {
   const dictationChunksRef = useRef<Blob[]>([]);
   const dictationIdRef = useRef('');
   const dictationTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const dictationUploadAbortRef = useRef<AbortController | null>(null);
   const displayRequestRef = useRef<{ requestId: string; blanked: boolean; timeout: ReturnType<typeof setTimeout> } | null>(null);
   const deviceIdRef = useRef('');
   const systemAudioEnabledRef = useRef(false);
@@ -389,7 +390,7 @@ export function RemoteController() {
   const startDictation = useCallback(async () => {
     if (!dictationAvailable) {
       setDictationState('error');
-      setDictationMessage('Add a Groq API key in the Windows companion first.');
+      setDictationMessage('Configure voice transcription in the Windows companion first.');
       return;
     }
     if (!connectionRef.current?.open || !navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
@@ -398,6 +399,8 @@ export function RemoteController() {
       return;
     }
     try {
+      dictationUploadAbortRef.current?.abort();
+      dictationUploadAbortRef.current = null;
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
         video: false,
@@ -428,14 +431,21 @@ export function RemoteController() {
         stopRecorderTracks();
         setDictationState('sending');
         setDictationMessage('Sending encrypted audio to the computer…');
+        const uploadController = new AbortController();
+        dictationUploadAbortRef.current?.abort();
+        dictationUploadAbortRef.current = uploadController;
         void (async () => {
-          const audio = new Uint8Array(await new Blob(dictationChunksRef.current, { type: mimeType }).arrayBuffer());
-          dictationChunksRef.current = [];
-          if (!audio.length) throw new Error('No audio was recorded.');
-          if (audio.length > 20 * 1024 * 1024) throw new Error('Recording is too large. Keep dictation under 90 seconds.');
-          await uploadDictationAudio(audio, id, async (message) => {
-            return sendPeerMessage(connectionRef.current, message);
-          });
+          try {
+            const audio = new Uint8Array(await new Blob(dictationChunksRef.current, { type: mimeType }).arrayBuffer());
+            dictationChunksRef.current = [];
+            if (!audio.length) throw new Error('No audio was recorded.');
+            if (audio.length > MAX_DICTATION_AUDIO_BYTES) throw new Error('Recording is too large. Keep dictation under 90 seconds.');
+            await uploadDictationAudio(audio, id, async (message) => {
+              return sendPeerMessage(connectionRef.current, message);
+            }, undefined, uploadController.signal);
+          } finally {
+            if (dictationUploadAbortRef.current === uploadController) dictationUploadAbortRef.current = null;
+          }
         })().catch((error) => {
           send({ type: 'dictation-cancel', id });
           setDictationState('error');
@@ -547,6 +557,8 @@ export function RemoteController() {
     setTrustedDevice(Boolean(trustedCredential));
 
     const cancelRevokedDictation = () => {
+      dictationUploadAbortRef.current?.abort();
+      dictationUploadAbortRef.current = null;
       const recorder = recorderRef.current;
       if (recorder?.state === 'recording') {
         recorder.onstop = null;
@@ -566,6 +578,8 @@ export function RemoteController() {
       resumeProbeSentAt = 0;
       if (signalingReconnectTimer) clearTimeout(signalingReconnectTimer);
       signalingReconnectTimer = null;
+      dictationUploadAbortRef.current?.abort();
+      dictationUploadAbortRef.current = null;
       const recorder = recorderRef.current;
       if (recorder?.state === 'recording') {
         recorder.onstop = null;
@@ -811,7 +825,17 @@ export function RemoteController() {
             }
           });
           activeConnection.on('close', () => scheduleReconnect(currentGeneration));
-          activeConnection.on('error', () => scheduleReconnect(currentGeneration));
+          activeConnection.on('error', (error) => {
+            if (error.type === 'message-too-big') {
+              dictationUploadAbortRef.current?.abort();
+              dictationUploadAbortRef.current = null;
+              send({ type: 'dictation-cancel', id: dictationIdRef.current });
+              setDictationState('error');
+              setDictationMessage('Voice upload was too large, but the remote-control connection stayed active.');
+              return;
+            }
+            scheduleReconnect(currentGeneration);
+          });
         }).catch(() => scheduleReconnect(currentGeneration));
       });
 
@@ -1394,6 +1418,10 @@ function RemoteSurface({
     if (typeof window === 'undefined') return false;
     return window.localStorage.getItem('compctrl.magnifierPinned') === 'true';
   });
+  const [remoteCursorVisible, setRemoteCursorVisible] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    return window.localStorage.getItem('compctrl.remoteCursorVisible') !== 'false';
+  });
   const [keyboardPanelEnabled, setKeyboardPanelEnabled] = useState(() => {
     if (typeof window === 'undefined') return false;
     return window.localStorage.getItem('compctrl.keyboardPanel') === 'true';
@@ -1690,8 +1718,9 @@ function RemoteSurface({
     window.localStorage.setItem('compctrl.tapToClick', String(tapToClick));
     window.localStorage.setItem('compctrl.sensitivity', String(sensitivity));
     window.localStorage.setItem('compctrl.magnifierPinned', String(magnifierPinned));
+    window.localStorage.setItem('compctrl.remoteCursorVisible', String(remoteCursorVisible));
     window.localStorage.setItem('compctrl.keyboardPanel', String(keyboardPanelEnabled));
-  }, [dragSelectionEnabled, keyboardPanelEnabled, magnifierPinned, pointerMode, sensitivity, tapToClick]);
+  }, [dragSelectionEnabled, keyboardPanelEnabled, magnifierPinned, pointerMode, remoteCursorVisible, sensitivity, tapToClick]);
 
   const magnifierVisible = Boolean(stream) && (magnifierOpen || magnifierPinned);
 
@@ -2163,7 +2192,7 @@ function RemoteSurface({
             style={videoStyle}
             onLoadedMetadata={measureStage}
           />
-          {stream && cursorVisible && hostCapabilities.remoteInput && (
+          {stream && cursorVisible && remoteCursorVisible && hostCapabilities.remoteInput && (
             <span
               className={`remote-cursor ${magnifierOpen ? 'is-precision' : ''}`}
               style={{ left: `${cursorDisplay.x * 100}%`, top: `${cursorDisplay.y * 100}%` }}
@@ -2496,6 +2525,11 @@ function RemoteSurface({
               <Switch checked={tapToClick} onCheckedChange={setTapToClick} aria-label="Toggle tap to click" />
             </div>
             <div className="control-row">
+              <span className="control-row-icon"><MousePointer2 /></span>
+              <span><strong>Show remote pointer</strong><small>Hide the large pointer overlay without changing the magnifier</small></span>
+              <Switch checked={remoteCursorVisible} onCheckedChange={setRemoteCursorVisible} aria-label="Show the remote pointer overlay" />
+            </div>
+            <div className="control-row">
               <span className="control-row-icon"><Crosshair /></span>
               <span><strong>Drag and select</strong><small>Hold the Windows mouse button while swiping</small></span>
               <Switch checked={dragSelectionEnabled} onCheckedChange={setDragSelectionEnabled} aria-label="Toggle drag and text selection" />
@@ -2533,7 +2567,7 @@ function RemoteSurface({
             </div>
             <div className="control-row">
               <span className="control-row-icon"><Mic /></span>
-              <span><strong>Groq voice dictation</strong><small>{dictationAvailable ? 'Ready · focuses the current Windows text field' : 'Add an API key in the Windows companion'}</small></span>
+              <span><strong>Voice dictation</strong><small>{dictationAvailable ? 'Ready · focuses the current Windows text field' : 'Configure Groq or local Whisper on the computer'}</small></span>
               <ShieldCheck className={dictationAvailable ? 'text-emerald-400' : 'opacity-30'} />
             </div>
             <div className="control-section-label">Session</div>

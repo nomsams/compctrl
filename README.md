@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.4.7-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.5.0-x64.exe
 ```
 
 ## Controls
@@ -56,7 +56,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - **Type** opens the phone's native keyboard in a compact typing strip by default. Enable **Show full PC key panel** when you want the keyboard button to open function keys, modifiers, navigation keys, and arrows instead.
 - Use the dedicated **Up** and **Down** buttons on the left edge of the desktop for reliable one-tap scrolling, or use the faster two-finger scroll gesture.
 - Fullscreen keeps scrolling on the left and adds a dedicated **Enter** key beside left and right click controls on the right.
-- For voice dictation, create a key in the [Groq console](https://console.groq.com/keys), save it in the Windows companion, focus the desired text field on the remote computer, then tap **Voice** on the phone. Tap again to stop; the companion transcribes with `whisper-large-v3-turbo` and inserts the result at the focused Windows caret.
+- For voice dictation, choose either Groq or the optional local provider in the Windows companion, focus the desired text field on the remote computer, then tap **Voice** on the phone. Groq uses the encrypted API key and `whisper-large-v3-turbo`. Local mode installs a pinned, checksum-verified `whisper.cpp` Windows binary and the multilingual `tiny-q5_1` model, then transcribes fully on the controlled PC. Local mode is off by default.
 - **Floating mini video** uses the phone browser's Picture-in-Picture mode when available, so the live computer view can stay above other apps. Return to the controller at any time; it resumes the existing session or reconnects automatically after mobile background suspension.
 - **Computer audio** can add Windows system sound to the P2P screen stream. It starts off for every new controller session and is enabled explicitly from session controls.
 - The session drawer controls the 30-second screen jiggler, disconnect, restart, and shutdown. Power actions require a 1.8-second hold.
@@ -79,7 +79,7 @@ To verify a downloaded build before running it, keep the executable and `SHA256S
 - WebRTC encrypts media and data in transit. The default public PeerJS signaling service can see connection metadata such as the temporary peer ID and IP addresses, but not decrypted screen or input data.
 - This build intentionally has no default TURN relay so the screen does not fall back to a third-party media server. A direct P2P route may fail on restrictive corporate, hotel, or carrier networks.
 - The native bridge accepts commands only through Electron IPC; it does not open a local TCP port. Restart and shutdown are unavailable until a paired WebRTC data channel is open, and the phone UI requires a press-and-hold confirmation.
-- The Groq key is encrypted with Electron `safeStorage` (Windows DPAPI) and is never returned to the phone or page. Dictation audio does leave the P2P session: the companion sends it over HTTPS to Groq for transcription. No Groq key is included in this repository or any build.
+- The Groq key is encrypted with Electron `safeStorage` (Windows DPAPI) and is never returned to the phone or page. In Groq mode, dictation audio leaves the P2P session over HTTPS to Groq. In local mode, audio is converted to 16 kHz mono PCM inside the companion and processed only by the locally installed Whisper model. No Groq key or Whisper model is included in this repository or any build.
 - Packaged companions verify the native bridge and bundled web assets against a SHA-256 manifest embedded inside the application before starting. Release checksums detect a damaged or substituted download, but they are not a substitute for code signing and cannot defend against an attacker who controls both the release account and its published hashes.
 - No remote-control application can remain trustworthy after an attacker gains administrator-level control of the Windows account or modifies the running operating system. The controls above are intended to prevent guessing, replay, malformed-message abuse, and accidental package corruption—not to claim protection from a fully compromised endpoint.
 - A compromised phone that is currently authorized for mouse and keyboard can act with the privileges of the signed-in Windows user. Keep dangerous permission switches off until needed, use a non-administrator Windows account for remote sessions, and trigger emergency lockdown locally if a controller behaves unexpectedly.

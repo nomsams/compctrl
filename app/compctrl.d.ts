@@ -27,6 +27,9 @@ declare global {
         screenBlanked: boolean;
         autoStart: boolean;
         groqKeyConfigured: boolean;
+        transcriptionProvider: 'groq' | 'local';
+        transcriptionReady: boolean;
+        localWhisper: { installed: boolean; modelName: string; modelSizeMb: number; build: string };
         trustedPeerId: string;
         trustedDevices: Array<{ id: string; name: string; createdAt: number; lastSeenAt: number; expiresAt: number }>;
         security: import('@/lib/protocol').SecuritySettings;
@@ -36,9 +39,12 @@ declare global {
         pairingCode?: string;
         controllerUrl?: string;
         autoStart?: boolean;
+        transcriptionProvider?: 'groq' | 'local';
         security?: import('@/lib/protocol').SecuritySettings;
       }): Promise<void>;
       setGroqApiKey(key: string): Promise<boolean>;
+      installLocalWhisper(): Promise<{ installed: boolean; modelName: string; modelSizeMb: number; build: string }>;
+      removeLocalWhisper(): Promise<{ installed: boolean; modelName: string; modelSizeMb: number; build: string }>;
       transcribeAudio(chunks: string[], mimeType: string): Promise<string>;
       issueTrustedDevice(deviceId: string, deviceName: string): Promise<{
         deviceId: string;

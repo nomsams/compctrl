@@ -30,6 +30,12 @@ const {
   trustedDeviceExpiry,
 } = require('./security.cjs');
 const { generateTrustedPeerId, isStoredTrustedPeerId } = require('./peer-identity.cjs');
+const {
+  installLocalWhisper,
+  localWhisperStatus,
+  removeLocalWhisper,
+  transcribeLocalWhisper,
+} = require('./local-whisper.cjs');
 
 // Desktop capture and WebRTC encoding should use the GPU by default. Forcing
 // software rendering can produce valid local pixels but black encoded frames
@@ -72,6 +78,7 @@ let screenBlanked = false;
 let isQuitting = false;
 let transcriptionInProgress = false;
 let transcriptionTimes = [];
+let localWhisperInstallPromise = null;
 let trustedRendererOrigin = '';
 let displayCaptureAuthorization = null;
 
@@ -120,6 +127,7 @@ function defaultSettings() {
     controllerUrl: process.env.COMPCTRL_WEB_URL || DEFAULT_CONTROLLER_URL,
     jigglerEnabled: false,
     autoStart: true,
+    transcriptionProvider: 'groq',
     groqApiKeyProtected: '',
     trustedPeerId: generateTrustedPeerId(),
     trustedDevices: [],
@@ -140,6 +148,7 @@ function readSettings() {
         : defaults.controllerUrl,
       jigglerEnabled: stored.jigglerEnabled === true,
       autoStart: stored.autoStart !== false,
+      transcriptionProvider: stored.transcriptionProvider === 'local' ? 'local' : 'groq',
       groqApiKeyProtected: typeof stored.groqApiKeyProtected === 'string' ? stored.groqApiKeyProtected : '',
       trustedPeerId: isStoredTrustedPeerId(stored.trustedPeerId)
         ? stored.trustedPeerId
@@ -424,7 +433,10 @@ function runSystemAction(action) {
 async function transcribeAudio(chunks, mimeType) {
   if (transcriptionInProgress) throw new Error('Another dictation is already being transcribed.');
   const normalizedMime = typeof mimeType === 'string' ? mimeType.toLowerCase() : '';
-  const allowedMimeTypes = new Set(['audio/webm', 'audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg', 'audio/ogg;codecs=opus']);
+  const local = settings.transcriptionProvider === 'local';
+  const allowedMimeTypes = local
+    ? new Set(['audio/wav'])
+    : new Set(['audio/webm', 'audio/webm;codecs=opus', 'audio/mp4', 'audio/ogg', 'audio/ogg;codecs=opus']);
   if (!allowedMimeTypes.has(normalizedMime) || !Array.isArray(chunks) || chunks.length < 1 || chunks.length > 2_048) {
     throw new Error('The recorded audio was invalid.');
   }
@@ -445,6 +457,7 @@ async function transcribeAudio(chunks, mimeType) {
   transcriptionTimes.push(now);
   transcriptionInProgress = true;
   try {
+    if (local) return await transcribeLocalWhisper(app.getPath('userData'), audio);
     const extension = normalizedMime.includes('mp4') ? 'mp4' : normalizedMime.includes('ogg') ? 'ogg' : 'webm';
     const form = new FormData();
     form.append('file', new Blob([audio], { type: normalizedMime }), `dictation.${extension}`);
@@ -573,12 +586,16 @@ function setScreenBlanked(enabled) {
 function registerIpc() {
   ipcMain.handle('compctrl:get-settings', (event) => {
     assertTrustedIpc(event);
+    const localWhisper = localWhisperStatus(app.getPath('userData'), true);
     return {
       pairingCode: settings.pairingCode,
       controllerUrl: settings.controllerUrl,
       jigglerEnabled: settings.jigglerEnabled,
       autoStart: settings.autoStart,
       groqKeyConfigured: hasGroqApiKey(),
+      transcriptionProvider: settings.transcriptionProvider,
+      transcriptionReady: settings.transcriptionProvider === 'local' ? localWhisper.installed : hasGroqApiKey(),
+      localWhisper,
       trustedPeerId: settings.trustedPeerId,
       trustedDevices: trustedDeviceSummaries(),
       security: settings.security,
@@ -605,6 +622,12 @@ function registerIpc() {
     if (typeof changes?.autoStart === 'boolean') {
       next.autoStart = changes.autoStart;
       configureAutoStart(next.autoStart);
+    }
+    if (changes?.transcriptionProvider === 'groq' || changes?.transcriptionProvider === 'local') {
+      if (changes.transcriptionProvider === 'local' && !localWhisperStatus(app.getPath('userData'), true).installed) {
+        throw new Error('Install the local Whisper model before selecting it.');
+      }
+      next.transcriptionProvider = changes.transcriptionProvider;
     }
     if (changes?.security && typeof changes.security === 'object') {
       next.security = normalizeSecuritySettings({ ...next.security, ...changes.security });
@@ -652,6 +675,24 @@ function registerIpc() {
   ipcMain.handle('compctrl:set-groq-api-key', (event, value) => {
     assertTrustedIpc(event);
     return setGroqApiKey(value);
+  });
+
+  ipcMain.handle('compctrl:install-local-whisper', async (event) => {
+    assertTrustedIpc(event);
+    if (!localWhisperInstallPromise) {
+      localWhisperInstallPromise = installLocalWhisper(app.getPath('userData'))
+        .finally(() => { localWhisperInstallPromise = null; });
+    }
+    return localWhisperInstallPromise;
+  });
+
+  ipcMain.handle('compctrl:remove-local-whisper', (event) => {
+    assertTrustedIpc(event);
+    if (settings.transcriptionProvider === 'local') {
+      settings.transcriptionProvider = 'groq';
+      writeSettings(settings);
+    }
+    return removeLocalWhisper(app.getPath('userData'));
   });
 
   ipcMain.handle('compctrl:transcribe-audio', (event, chunks, audioMimeType) => {
