@@ -36,7 +36,7 @@ The `Build Windows companion` workflow can be run manually from the Actions page
 To verify a downloaded build before running it, keep the executable and `SHA256SUMS.txt` together and run:
 
 ```powershell
-./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.5.0-x64.exe
+./Verify-CompCtrl.ps1 ./CompCtrl-Setup-0.5.1-x64.exe
 ```
 
 ## Controls

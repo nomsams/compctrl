@@ -53,7 +53,7 @@ if (process.platform === 'win32') {
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 12;
 const JIGGLE_INTERVAL_MS = 30_000;
-const DISPLAY_OFF_REASSERT_MS = 2_000;
+const DISPLAY_OFF_REASSERT_MS = 30_000;
 const DISPLAY_CAPTURE_AUTHORIZATION_MS = 5_000;
 const GROQ_TRANSCRIPTION_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
 const GROQ_WHISPER_MODEL = 'whisper-large-v3-turbo';
@@ -73,7 +73,6 @@ let nativeQueue = [];
 let jigglerTimer = null;
 let displaySleepBlocker = null;
 let displayOffTimer = null;
-let displayOffAfterInputTimer = null;
 let screenBlanked = false;
 let isQuitting = false;
 let transcriptionInProgress = false;
@@ -366,13 +365,6 @@ function sendNative(message) {
     return;
   }
   nativeBridge.stdin.write(line);
-  if (screenBlanked && ['pointer', 'wheel', 'key', 'text', 'jiggle'].includes(message.type)) {
-    if (displayOffAfterInputTimer) clearTimeout(displayOffAfterInputTimer);
-    displayOffAfterInputTimer = setTimeout(() => {
-      displayOffAfterInputTimer = null;
-      sendNative({ type: 'display-power', state: 'off' });
-    }, 80);
-  }
 }
 
 function startNativeBridge() {
@@ -392,6 +384,7 @@ function startNativeBridge() {
     if (chunk.includes('READY')) {
       nativeBridgeReady = true;
       for (const line of nativeQueue.splice(0)) nativeBridge.stdin.write(line);
+      if (screenBlanked) nativeBridge.stdin.write(`${JSON.stringify({ type: 'display-power', state: 'off' })}\n`);
     }
   });
   nativeBridge.on('exit', () => {
@@ -565,9 +558,7 @@ function updateTrayMenu() {
 
 function setScreenBlanked(enabled) {
   if (displayOffTimer) clearInterval(displayOffTimer);
-  if (displayOffAfterInputTimer) clearTimeout(displayOffAfterInputTimer);
   displayOffTimer = null;
-  displayOffAfterInputTimer = null;
   screenBlanked = Boolean(enabled);
   sendNative({ type: 'display-power', state: screenBlanked ? 'off' : 'on' });
   if (screenBlanked) {
@@ -937,7 +928,6 @@ app.on('before-quit', () => {
 app.on('will-quit', () => {
   screenBlanked = false;
   if (displayOffTimer) clearInterval(displayOffTimer);
-  if (displayOffAfterInputTimer) clearTimeout(displayOffAfterInputTimer);
   globalShortcut.unregisterAll();
   if (jigglerTimer) clearInterval(jigglerTimer);
   if (nativeBridge?.stdin?.writable) nativeBridge.stdin.end();

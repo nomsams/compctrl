@@ -8,6 +8,8 @@ using System.Threading;
 
 public static class CompCtrlNative
 {
+    private static bool KeepDisplayOff = false;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
 
@@ -164,6 +166,17 @@ public static class CompCtrlNative
         }
     }
 
+    public static void SetDisplayPower(bool off)
+    {
+        KeepDisplayOff = off;
+        DisplayPower(off);
+    }
+
+    public static void PreserveDisplayPower()
+    {
+        if (KeepDisplayOff) DisplayPower(true);
+    }
+
     public static void ReleaseAll()
     {
         Button("left", false);
@@ -218,8 +231,11 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
             'key' { Invoke-KeyMessage $message }
             'text' { [CompCtrlNative]::Text([string]$message.text) }
             'jiggle' { [CompCtrlNative]::Jiggle() }
-            'display-power' { [CompCtrlNative]::DisplayPower(([string]$message.state) -eq 'off') }
+            'display-power' { [CompCtrlNative]::SetDisplayPower(([string]$message.state) -eq 'off') }
             'release-all' { [CompCtrlNative]::ReleaseAll() }
+        }
+        if (@('pointer', 'wheel', 'key', 'text', 'jiggle', 'release-all') -contains [string]$message.type) {
+            [CompCtrlNative]::PreserveDisplayPower()
         }
     }
     catch {

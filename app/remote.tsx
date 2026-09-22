@@ -175,6 +175,11 @@ const extraKeys = [
   'F13', 'F14', 'F15', 'F16', 'F17', 'F18', 'F19', 'F20', 'F21', 'F22', 'F23', 'F24',
 ] as const;
 
+const MAGNIFIER_WIDTH = 272;
+const MAGNIFIER_HEIGHT = 164;
+const TWO_FINGER_SCROLL_X_GAIN = 4;
+const TWO_FINGER_SCROLL_Y_GAIN = 10;
+
 const keyLabels: Record<string, string> = {
   Escape: 'Esc',
   Backspace: '⌫',
@@ -1732,15 +1737,17 @@ function RemoteSurface({
       const canvas = magnifierCanvasRef.current;
       const box = contentBoxRef.current;
       if (video && canvas && video.readyState >= 2 && video.videoWidth && box.width) {
-        const cssSize = 176;
+        const cssWidth = MAGNIFIER_WIDTH;
+        const cssHeight = MAGNIFIER_HEIGHT;
         const ratio = Math.min(window.devicePixelRatio || 1, 2);
-        const pixelSize = Math.round(cssSize * ratio);
-        if (canvas.width !== pixelSize || canvas.height !== pixelSize) {
-          canvas.width = pixelSize;
-          canvas.height = pixelSize;
+        const pixelWidth = Math.round(cssWidth * ratio);
+        const pixelHeight = Math.round(cssHeight * ratio);
+        if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+          canvas.width = pixelWidth;
+          canvas.height = pixelHeight;
         }
-        const cropWidth = Math.min(video.videoWidth, video.videoWidth * cssSize / (box.width * 3));
-        const cropHeight = Math.min(video.videoHeight, video.videoHeight * cssSize / (box.height * 3));
+        const cropWidth = Math.min(video.videoWidth, video.videoWidth * cssWidth / (box.width * 3));
+        const cropHeight = Math.min(video.videoHeight, video.videoHeight * cssHeight / (box.height * 3));
         const desiredX = pointerState.current.cursor.x * video.videoWidth - cropWidth / 2;
         const desiredY = pointerState.current.cursor.y * video.videoHeight - cropHeight / 2;
         const sourceX = clamp(desiredX, 0, video.videoWidth);
@@ -1749,14 +1756,14 @@ function RemoteSurface({
         const sourceBottom = clamp(desiredY + cropHeight, 0, video.videoHeight);
         const sourceWidth = Math.max(0, sourceRight - sourceX);
         const sourceHeight = Math.max(0, sourceBottom - sourceY);
-        const destinationX = (sourceX - desiredX) / cropWidth * pixelSize;
-        const destinationY = (sourceY - desiredY) / cropHeight * pixelSize;
-        const destinationWidth = sourceWidth / cropWidth * pixelSize;
-        const destinationHeight = sourceHeight / cropHeight * pixelSize;
+        const destinationX = (sourceX - desiredX) / cropWidth * pixelWidth;
+        const destinationY = (sourceY - desiredY) / cropHeight * pixelHeight;
+        const destinationWidth = sourceWidth / cropWidth * pixelWidth;
+        const destinationHeight = sourceHeight / cropHeight * pixelHeight;
         const context = canvas.getContext('2d');
         if (context) {
           context.fillStyle = '#080b11';
-          context.fillRect(0, 0, pixelSize, pixelSize);
+          context.fillRect(0, 0, pixelWidth, pixelHeight);
           if (sourceWidth && sourceHeight) {
             context.drawImage(video, sourceX, sourceY, sourceWidth, sourceHeight, destinationX, destinationY, destinationWidth, destinationHeight);
           }
@@ -1871,17 +1878,25 @@ function RemoteSurface({
       const spreadChange = Math.abs(distance - multi.startDistance);
       const midpointTravel = Math.hypot(midpoint.x - multi.startMidpoint.x, midpoint.y - multi.startMidpoint.y);
       multi.movedPointers.add(event.pointerId);
-      if (spreadChange > 7 || midpointTravel > 8) multi.tapCandidate = false;
-      if (multi.mode === 'pending' && multi.movedPointers.size >= 2 && (spreadChange > 7 || midpointTravel > 8)) {
-        multi.mode = spreadChange > midpointTravel * 0.7 ? 'pinch' : 'scroll';
+      if (spreadChange > 5 || midpointTravel > 5) multi.tapCandidate = false;
+      const previousMode = multi.mode;
+      if (
+        multi.mode === 'pending'
+        && (spreadChange > 5 || midpointTravel > 5)
+        && (multi.movedPointers.size >= 2 || midpointTravel > 14)
+      ) {
+        multi.mode = spreadChange > 9 && spreadChange > midpointTravel * 1.35 ? 'pinch' : 'scroll';
       }
       if (multi.mode === 'pinch') {
         const nextScale = clamp(multi.startZoom * distance / multi.startDistance, 1, MAX_VIEW_SCALE);
         updateView(viewAroundAnchor(nextScale, multi.anchorScreen, clientToDisplay(midpoint.x, midpoint.y)));
       } else if (multi.mode === 'scroll') {
-        const deltaX = (multi.lastMidpoint.x - midpoint.x) * 1.8;
-        const deltaY = (multi.lastMidpoint.y - midpoint.y) * 3.6;
-        if (hostCapabilities.remoteInput && (Math.abs(deltaX) > 0.4 || Math.abs(deltaY) > 0.4)) send({ type: 'wheel', deltaX, deltaY });
+        const scrollOrigin = previousMode === 'pending' ? multi.startMidpoint : multi.lastMidpoint;
+        const deltaX = (scrollOrigin.x - midpoint.x) * TWO_FINGER_SCROLL_X_GAIN;
+        const deltaY = (scrollOrigin.y - midpoint.y) * TWO_FINGER_SCROLL_Y_GAIN;
+        if (hostCapabilities.remoteInput && (Math.abs(deltaX) >= 0.25 || Math.abs(deltaY) >= 0.25)) {
+          send({ type: 'wheel', deltaX, deltaY });
+        }
       }
       multi.lastMidpoint = midpoint;
       return;
